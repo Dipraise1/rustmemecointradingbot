@@ -1,0 +1,52 @@
+[package]
+name = "trading-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web Server
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Async Runtime
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Solana
+solana-sdk = "1.18"
+solana-client = "1.18"
+
+# EVM - Using ethers-rs for now (alloy is still in development)
+ethers = { version = "2.0", features = ["ws", "rustls"] }
+
+# HTTP Client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Time
+chrono = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Environment
+dotenv = "0.15"
+
+# UUID for position IDs
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Wallet generation and crypto
+rand = "0.8"
+bs58 = "0.5"
+hex = "0.4"
+base64 = "0.21"
+sha3 = "0.10"  # For Keccak256 (Ethereum addresses)
+pbkdf2 = "0.12"
