@@ -1207,10 +1207,10 @@ bot.command('alerts', async (ctx) => {
       else if (alert.alert_type === "balance") emoji = "💼";
       
       message += `${emoji} <b>${alert.alert_type.toUpperCase()}</b>\n`;
-      if alert.chain {
+      if (alert.chain) {
         message += `Chain: ${alert.chain.toUpperCase()}\n`;
       }
-      if alert.token {
+      if (alert.token) {
         message += `Token: <code>${alert.token.slice(0, 8)}...</code>\n`;
       }
       message += `Threshold: ${alert.threshold}\n`;

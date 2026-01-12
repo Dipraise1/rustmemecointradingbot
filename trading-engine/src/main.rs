@@ -335,9 +335,10 @@ async fn check_token_security(
             .and_then(|r| r.as_object())
             .and_then(|r| r.get(token))
     } else {
+        let token_lower = token.to_lowercase();
         json.get("result")
             .and_then(|r| r.as_object())
-            .and_then(|r| r.get(token.to_lowercase()))
+            .and_then(|r| r.get(&token_lower))
     };
     
     if let Some(data) = token_data.and_then(|d| d.as_object()) {
@@ -728,8 +729,19 @@ async fn import_data(
 ) -> impl IntoResponse {
     match request.data_type.as_str() {
         "wallets" => {
-            let wallets_data = request.data.as_array()
-                .ok_or_else(|| "Invalid wallets data format".to_string())?;
+            let wallets_data = match request.data.as_array() {
+                Some(arr) => arr.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(wallet::ImportDataResponse {
+                            success: false,
+                            imported_count: 0,
+                            errors: vec!["Invalid wallets data format".to_string()],
+                        }),
+                    );
+                }
+            };
             
             match wallet::import_wallets_data(request.user_id, wallets_data.clone()) {
                 Ok(result) => {
@@ -782,8 +794,19 @@ async fn import_data(
             }
         }
         "positions" => {
-            let positions_data = request.data.as_array()
-                .ok_or_else(|| "Invalid positions data format".to_string())?;
+            let positions_data = match request.data.as_array() {
+                Some(arr) => arr.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(wallet::ImportDataResponse {
+                            success: false,
+                            imported_count: 0,
+                            errors: vec!["Invalid positions data format".to_string()],
+                        }),
+                    );
+                }
+            };
             
             let mut imported = 0;
             let mut errors = Vec::new();
@@ -1036,7 +1059,7 @@ async fn get_wallet_balance(
     };
     
     match balance_result {
-        Ok(bal) => (StatusCode::OK, Json(bal)),
+        Ok(bal) => (StatusCode::OK, Json(serde_json::to_value(bal).unwrap_or(serde_json::json!({})))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -1163,7 +1186,7 @@ async fn create_alert(
     State(state): State<AppState>,
     Json(alert): Json<notifications::Alert>,
 ) -> impl IntoResponse {
-    let alert_key = format!("{}_{}_{}", alert.user_id, alert.alert_type, alert.timestamp);
+    let alert_key = format!("{}_{}_{}", alert.user_id, alert.alert_type, alert.created_at);
     state.alerts.write().await.insert(alert_key.clone(), alert.clone());
     
     (
@@ -1207,9 +1230,13 @@ async fn main() {
     let solana_rpc = std::env::var("SOLANA_RPC")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     let solana_client = Arc::new(RpcClient::new_with_commitment(
-        solana_rpc,
+        solana_rpc.clone(),
         CommitmentConfig::confirmed(),
     ));
+    
+    tracing::info!("🔗 Solana RPC: {}", solana_rpc);
+    tracing::info!("🔗 Ethereum RPC: {}", std::env::var("ETH_RPC").unwrap_or_else(|_| "default".to_string()));
+    tracing::info!("🔗 BSC RPC: {}", std::env::var("BSC_RPC").unwrap_or_else(|_| "default".to_string()));
     
     let state = AppState {
         positions: Arc::new(RwLock::new(HashMap::new())),
@@ -1220,7 +1247,7 @@ async fn main() {
     };
     
     // Start position monitoring in background
-    let monitor_state = state.clone();
+    let monitor_state = Arc::new(state.clone());
     tokio::spawn(async move {
         monitor_positions(monitor_state).await;
     });

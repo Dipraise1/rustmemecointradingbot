@@ -9,7 +9,7 @@ use rand::Rng;
 use bs58;
 use hex;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ethers::core::k256::ecdsa::SigningKey;
+use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use sha3::{Keccak256, Digest};
 use chrono::Utc;
 
@@ -64,7 +64,8 @@ pub struct ImportDataResponse {
 // ==================== ENCRYPTION ====================
 pub fn encrypt_key(key: &str, user_id: i64) -> String {
     let key_bytes = key.as_bytes();
-    let user_bytes = user_id.to_string().as_bytes();
+    let user_id_str = user_id.to_string();
+    let user_bytes = user_id_str.as_bytes();
     let mut encrypted = Vec::new();
     
     for (i, byte) in key_bytes.iter().enumerate() {
@@ -78,7 +79,8 @@ pub fn encrypt_key(key: &str, user_id: i64) -> String {
 pub fn decrypt_key(encrypted: &str, user_id: i64) -> Result<String, String> {
     let encrypted_bytes = STANDARD.decode(encrypted)
         .map_err(|e| format!("Decode error: {}", e))?;
-    let user_bytes = user_id.to_string().as_bytes();
+    let user_id_str = user_id.to_string();
+    let user_bytes = user_id_str.as_bytes();
     let mut decrypted = Vec::new();
     
     for (i, byte) in encrypted_bytes.iter().enumerate() {
@@ -127,16 +129,16 @@ pub fn get_solana_keypair(encrypted_key: &str, user_id: i64) -> Result<Keypair, 
 
 // ==================== EVM WALLETS ====================
 pub fn generate_evm_wallet() -> Result<(String, String, String), String> {
+    let secp = Secp256k1::new();
     let mut rng = rand::thread_rng();
     let mut private_key_bytes = [0u8; 32];
     rng.fill(&mut private_key_bytes);
     
-    let signing_key = SigningKey::from_bytes(&private_key_bytes.into())
-        .map_err(|e| format!("Invalid signing key: {}", e))?;
+    let secret_key = SecretKey::from_slice(&private_key_bytes)
+        .map_err(|e| format!("Invalid secret key: {}", e))?;
     
-    let verifying_key = signing_key.verifying_key();
-    let public_key = verifying_key.to_encoded_point(false);
-    let public_key_bytes = public_key.as_bytes();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    let public_key_bytes = public_key.serialize_uncompressed();
     
     let hash = Keccak256::digest(&public_key_bytes[1..]);
     let address_bytes = &hash[12..32];
@@ -160,12 +162,12 @@ pub fn import_evm_wallet(private_key: &str) -> Result<(String, String), String> 
         return Err("Invalid private key length (must be 32 bytes)".to_string());
     }
     
-    let signing_key = SigningKey::from_bytes(&private_key_bytes[..].into())
-        .map_err(|e| format!("Invalid signing key: {}", e))?;
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&private_key_bytes)
+        .map_err(|e| format!("Invalid secret key: {}", e))?;
     
-    let verifying_key = signing_key.verifying_key();
-    let public_key = verifying_key.to_encoded_point(false);
-    let public_key_bytes = public_key.as_bytes();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    let public_key_bytes = public_key.serialize_uncompressed();
     
     let hash = Keccak256::digest(&public_key_bytes[1..]);
     let address_bytes = &hash[12..32];
@@ -174,15 +176,15 @@ pub fn import_evm_wallet(private_key: &str) -> Result<(String, String), String> 
     Ok((address_hex, format!("0x{}", hex::encode(private_key_bytes))))
 }
 
-pub fn get_evm_signing_key(encrypted_key: &str, user_id: i64) -> Result<SigningKey, String> {
+pub fn get_evm_signing_key(encrypted_key: &str, user_id: i64) -> Result<SecretKey, String> {
     let private_key = decrypt_key(encrypted_key, user_id)?;
     let key_hex = private_key.strip_prefix("0x").unwrap_or(&private_key);
     
     let private_key_bytes = hex::decode(key_hex)
         .map_err(|e| format!("Invalid hex: {}", e))?;
     
-    SigningKey::from_bytes(&private_key_bytes[..].into())
-        .map_err(|e| format!("Invalid signing key: {}", e))
+    SecretKey::from_slice(&private_key_bytes)
+        .map_err(|e| format!("Invalid secret key: {}", e))
 }
 
 // ==================== WALLET OPERATIONS ====================

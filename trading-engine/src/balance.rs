@@ -47,6 +47,7 @@ pub async fn get_solana_balance(
         .unwrap()
         .as_secs() as i64;
     
+    let sol_balance_str_clone = sol_balance_str.clone();
     Ok(WalletBalance {
         chain: "solana".to_string(),
         address: address.to_string(),
@@ -56,7 +57,7 @@ pub async fn get_solana_balance(
             TokenBalance {
                 token: "So11111111111111111111111111111111111111112".to_string(),
                 symbol: "SOL".to_string(),
-                balance: sol_balance_str.clone(),
+                balance: sol_balance_str_clone,
                 balance_usd: native_balance_usd,
             },
         ],
