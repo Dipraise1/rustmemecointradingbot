@@ -6,6 +6,7 @@ use std::collections::HashMap;
 pub struct TokenPrice {
     pub chain: String,
     pub token: String,
+    pub token_symbol: Option<String>,
     pub price_usd: f64,
     pub price_native: f64,
     pub volume_24h: f64,
@@ -92,9 +93,17 @@ pub async fn fetch_token_price(chain: &str, token: &str) -> Result<TokenPrice, S
         _ => price_usd,
     };
     
+    // Get token symbol from pair data
+    let token_symbol = pair.get("baseToken")
+        .and_then(|t| t.as_object())
+        .and_then(|t| t.get("symbol"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    
     Ok(TokenPrice {
         chain: chain.to_string(),
         token: token.to_string(),
+        token_symbol,
         price_usd,
         price_native,
         volume_24h,

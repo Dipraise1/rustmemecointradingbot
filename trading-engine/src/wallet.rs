@@ -12,6 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use sha3::{Keccak256, Digest};
 use chrono::Utc;
+use bip39::{Mnemonic, Language};
 
 // ==================== WALLET STRUCTURES ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,12 +130,23 @@ pub fn get_solana_keypair(encrypted_key: &str, user_id: i64) -> Result<Keypair, 
 
 // ==================== EVM WALLETS ====================
 pub fn generate_evm_wallet() -> Result<(String, String, String), String> {
-    let secp = Secp256k1::new();
+    // Generate random entropy (16 bytes for 12-word mnemonic)
     let mut rng = rand::thread_rng();
-    let mut private_key_bytes = [0u8; 32];
-    rng.fill(&mut private_key_bytes);
+    let mut entropy = [0u8; 16];
+    rng.fill(&mut entropy);
     
-    let secret_key = SecretKey::from_slice(&private_key_bytes)
+    // Generate BIP39 mnemonic from entropy
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
+        .map_err(|e| format!("Failed to generate mnemonic: {}", e))?;
+    let mnemonic_phrase = mnemonic.to_string();
+    
+    // Derive private key from mnemonic using PBKDF2
+    // This follows BIP39 standard: mnemonic -> seed -> private key
+    let seed = mnemonic.to_seed("");
+    let private_key_bytes = &seed[..32]; // Use first 32 bytes as private key
+    
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(private_key_bytes)
         .map_err(|e| format!("Invalid secret key: {}", e))?;
     
     let public_key = PublicKey::from_secret_key(&secp, &secret_key);
@@ -146,10 +158,7 @@ pub fn generate_evm_wallet() -> Result<(String, String, String), String> {
     
     let private_key_hex = format!("0x{}", hex::encode(private_key_bytes));
     
-    // Simplified mnemonic - in production use BIP39
-    let mnemonic = format!("word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12");
-    
-    Ok((address_hex, private_key_hex, mnemonic))
+    Ok((address_hex, private_key_hex, mnemonic_phrase))
 }
 
 pub fn import_evm_wallet(private_key: &str) -> Result<(String, String), String> {

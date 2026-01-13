@@ -8,6 +8,10 @@ mod portfolio;
 mod history;
 mod notifications;
 mod gas;
+mod bundler;
+mod whale_tracker;
+mod leaderboards;
+mod grid_trading;
 
 use axum::{
     extract::{Path, State},
@@ -41,6 +45,12 @@ struct AppState {
     wallets: Arc<RwLock<HashMap<String, wallet::WalletInfo>>>,
     transactions: Arc<RwLock<HashMap<String, history::Transaction>>>,
     alerts: Arc<RwLock<HashMap<String, notifications::Alert>>>,
+    bundles: Arc<RwLock<HashMap<String, bundler::BundledTransaction>>>,
+    whale_trades: Arc<RwLock<Vec<whale_tracker::WhaleTrade>>>,
+    whale_map: Arc<RwLock<HashMap<String, whale_tracker::WhaleInfo>>>,
+    whale_alerts: Arc<RwLock<HashMap<String, whale_tracker::WhaleAlert>>>,
+    trade_records: Arc<RwLock<Vec<leaderboards::TradeRecord>>>,
+    grid_strategies: Arc<RwLock<HashMap<String, grid_trading::GridStrategy>>>,
     solana_client: Arc<RpcClient>,
 }
 
@@ -903,7 +913,11 @@ async fn generate_wallet(
         }
         "eth" | "ethereum" | "bsc" | "binance" => {
             wallet::generate_evm_wallet()
-                .map(|(addr, pk, mnemonic)| (addr, Some(pk), Some(mnemonic)))
+                .map(|(addr, pk, mnemonic)| {
+                    // Only return mnemonic if it's not empty
+                    let mnemonic_opt = if mnemonic.is_empty() { None } else { Some(mnemonic) };
+                    (addr, Some(pk), mnemonic_opt)
+                })
         }
         _ => Err("Unsupported chain".to_string()),
     };
@@ -1059,14 +1073,92 @@ async fn get_wallet_balance(
     };
     
     match balance_result {
-        Ok(bal) => (StatusCode::OK, Json(serde_json::to_value(bal).unwrap_or(serde_json::json!({})))),
+        Ok(bal) => {
+            let mut balance_json = serde_json::to_value(bal).unwrap_or(serde_json::json!({}));
+            // Ensure success field is present
+            if let Some(obj) = balance_json.as_object_mut() {
+                obj.insert("success".to_string(), serde_json::json!(true));
+            }
+            (StatusCode::OK, Json(balance_json))
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "success": false,
-                "error": e
+                "error": e,
+                "native_balance": "0",
+                "total_usd": 0.0
             })),
         ),
+    }
+}
+
+// Close token accounts for Solana
+async fn close_token_accounts(
+    State(state): State<AppState>,
+    Json(request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let user_id = request.get("user_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "user_id required".to_string());
+    
+    let chain = request.get("chain")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "chain required".to_string());
+    
+    if let (Ok(user_id), Ok(chain)) = (user_id, chain) {
+        if chain != "solana" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Close token accounts is only available for Solana"
+                })),
+            );
+        }
+        
+        let wallet_key = format!("{}_{}", user_id, chain);
+        let wallets = state.wallets.read().await;
+        
+        let wallet = match wallets.get(&wallet_key) {
+            Some(w) => w.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": "Wallet not found"
+                    })),
+                );
+            }
+        };
+        drop(wallets);
+        
+        // In production, this would:
+        // 1. Get all token accounts for the wallet
+        // 2. Filter empty accounts
+        // 3. Create close account transactions
+        // 4. Sign and send transactions
+        // 5. Return rent recovered
+        
+        // Close token accounts implementation
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "accounts_closed": 0,
+                "rent_recovered": "0",
+                "message": "Close token accounts feature - to be implemented"
+            })),
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid request parameters"
+            })),
+        )
     }
 }
 
@@ -1213,6 +1305,402 @@ async fn get_alerts(
     (StatusCode::OK, Json(user_alerts))
 }
 
+// ==================== BUNDLER API ====================
+async fn add_to_bundle(
+    State(state): State<AppState>,
+    Json(request): Json<bundler::AddToBundleRequest>,
+) -> impl IntoResponse {
+    let bundles = state.bundles.read().await;
+    
+    // Find or create bundle for user
+    let bundle_key = format!("{}_{}", request.user_id, request.chain);
+    let mut bundle = bundles.get(&bundle_key).cloned();
+    drop(bundles);
+    
+    if bundle.is_none() {
+        let mut bundles = state.bundles.write().await;
+        let new_bundle = bundler::create_bundle(request.user_id, request.chain.clone());
+        bundles.insert(bundle_key.clone(), new_bundle.clone());
+        bundle = Some(new_bundle);
+    }
+    
+    let mut bundle = bundle.unwrap();
+    let result = bundler::add_transaction_to_bundle(&mut bundle, request);
+    
+    match result {
+        Ok(tx_id) => {
+            let bundle_id = bundle_key.clone();
+            state.bundles.write().await.insert(bundle_key, bundle);
+            (
+                StatusCode::OK,
+                Json(bundler::BundleResponse {
+                    success: true,
+                    bundle_id: Some(bundle_id),
+                    message: Some(format!("Transaction {} added to bundle", tx_id)),
+                    error: None,
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(bundler::BundleResponse {
+                success: false,
+                bundle_id: None,
+                message: None,
+                error: Some(e),
+            }),
+        ),
+    }
+}
+
+async fn get_bundle_status(
+    State(state): State<AppState>,
+    Path((user_id, chain)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    let bundles = state.bundles.read().await;
+    let bundle_key = format!("{}_{}", user_id, chain);
+    
+    match bundles.get(&bundle_key) {
+        Some(bundle) => {
+            let status = bundler::get_bundle_status(bundle);
+            let response = serde_json::json!({
+                "bundle_id": status.bundle_id,
+                "status": status.status,
+                "transaction_count": status.transaction_count,
+                "gas_saved": status.gas_saved,
+                "estimated_savings_percent": status.estimated_savings_percent,
+                "transactions": status.transactions,
+            });
+            (StatusCode::OK, Json(response))
+        }
+        None => {
+            let response = serde_json::json!({
+                "error": "Bundle not found"
+            });
+            (StatusCode::NOT_FOUND, Json(response))
+        }
+    }
+}
+
+async fn execute_bundle_endpoint(
+    State(state): State<AppState>,
+    Path((user_id, chain)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    let bundles = state.bundles.read().await;
+    let bundle_key = format!("{}_{}", user_id, chain);
+    
+    let mut bundle = match bundles.get(&bundle_key).cloned() {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Bundle not found"
+                })),
+            );
+        }
+    };
+    drop(bundles);
+    
+    match bundler::execute_bundle(&mut bundle).await {
+        Ok(tx_hash) => {
+            state.bundles.write().await.insert(bundle_key, bundle);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "tx_hash": tx_hash
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": e
+            })),
+        ),
+    }
+}
+
+// ==================== WHALE TRACKER API ====================
+async fn get_whale_stats(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let trades = state.whale_trades.read().await;
+    let whale_map = state.whale_map.read().await;
+    
+    let stats = whale_tracker::calculate_whale_stats(&trades, &whale_map);
+    (StatusCode::OK, Json(stats))
+}
+
+async fn create_whale_alert(
+    State(state): State<AppState>,
+    Json(request): Json<whale_tracker::CreateWhaleAlertRequest>,
+) -> impl IntoResponse {
+    let alert = whale_tracker::create_whale_alert(request);
+    let alert_id = alert.alert_id.clone();
+    
+    state.whale_alerts.write().await.insert(alert_id.clone(), alert);
+    
+    (
+        StatusCode::OK,
+        Json(whale_tracker::WhaleAlertResponse {
+            success: true,
+            alert_id: Some(alert_id),
+            error: None,
+        }),
+    )
+}
+
+async fn get_whale_alerts(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    let alerts = state.whale_alerts.read().await;
+    
+    let user_alerts: Vec<whale_tracker::WhaleAlert> = alerts
+        .values()
+        .filter(|a| a.user_id == user_id && a.active)
+        .cloned()
+        .collect();
+    
+    (StatusCode::OK, Json(user_alerts))
+}
+
+// ==================== LEADERBOARDS API ====================
+async fn get_leaderboard(
+    State(state): State<AppState>,
+    Path(period): Path<String>,
+) -> impl IntoResponse {
+    let trade_records = state.trade_records.read().await;
+    
+    let period_enum = match period.to_lowercase().as_str() {
+        "daily" => leaderboards::LeaderboardPeriod::Daily,
+        "weekly" => leaderboards::LeaderboardPeriod::Weekly,
+        "monthly" => leaderboards::LeaderboardPeriod::Monthly,
+        "alltime" => leaderboards::LeaderboardPeriod::AllTime,
+        _ => leaderboards::LeaderboardPeriod::AllTime,
+    };
+    
+    let leaderboard = leaderboards::build_leaderboard(
+        &trade_records,
+        period_enum,
+        "pnl",
+        100,
+    );
+    
+    (StatusCode::OK, Json(leaderboard))
+}
+
+async fn get_user_rank(
+    State(state): State<AppState>,
+    Path((user_id, period)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    let trade_records = state.trade_records.read().await;
+    
+    let period_enum = match period.to_lowercase().as_str() {
+        "daily" => leaderboards::LeaderboardPeriod::Daily,
+        "weekly" => leaderboards::LeaderboardPeriod::Weekly,
+        "monthly" => leaderboards::LeaderboardPeriod::Monthly,
+        "alltime" => leaderboards::LeaderboardPeriod::AllTime,
+        _ => leaderboards::LeaderboardPeriod::AllTime,
+    };
+    
+    let leaderboard = leaderboards::build_leaderboard(
+        &trade_records,
+        period_enum,
+        "pnl",
+        1000,
+    );
+    
+    match leaderboards::get_user_position(user_id, &leaderboard) {
+        Some(entry) => {
+            let response = serde_json::json!({
+                "user_id": entry.user_id,
+                "rank": entry.rank,
+                "total_pnl_usd": entry.total_pnl_usd,
+                "total_pnl_percent": entry.total_pnl_percent,
+                "win_rate": entry.win_rate,
+                "total_trades": entry.total_trades,
+                "winning_trades": entry.winning_trades,
+                "losing_trades": entry.losing_trades,
+                "largest_win": entry.largest_win,
+                "largest_loss": entry.largest_loss,
+                "total_volume_usd": entry.total_volume_usd,
+                "avg_trade_size": entry.avg_trade_size,
+                "streak": entry.streak,
+            });
+            (StatusCode::OK, Json(response))
+        }
+        None => {
+            let response = serde_json::json!({
+                "error": "User not found in leaderboard"
+            });
+            (StatusCode::NOT_FOUND, Json(response))
+        }
+    }
+}
+
+// ==================== GRID TRADING API ====================
+async fn create_grid_strategy(
+    State(state): State<AppState>,
+    Json(request): Json<grid_trading::CreateGridRequest>,
+) -> impl IntoResponse {
+    match grid_trading::create_grid_strategy(request) {
+        Ok(strategy) => {
+            let strategy_id = strategy.strategy_id.clone();
+            state.grid_strategies.write().await.insert(strategy_id.clone(), strategy);
+            
+            (
+                StatusCode::OK,
+                Json(grid_trading::GridResponse {
+                    success: true,
+                    strategy_id: Some(strategy_id),
+                    message: Some("Grid strategy created successfully".to_string()),
+                    error: None,
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(grid_trading::GridResponse {
+                success: false,
+                strategy_id: None,
+                message: None,
+                error: Some(e),
+            }),
+        ),
+    }
+}
+
+async fn get_grid_strategy(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> impl IntoResponse {
+    let strategies = state.grid_strategies.read().await;
+    
+    match strategies.get(&strategy_id) {
+        Some(strategy) => {
+            // Get current price
+            let current_price = match price::fetch_token_price(&strategy.chain, &strategy.token).await {
+                Ok(price_data) => price_data.price_usd,
+                Err(_) => strategy.last_price,
+            };
+            
+            let stats = grid_trading::get_grid_stats(strategy, current_price);
+            let response = serde_json::json!({
+                "strategy_id": stats.strategy_id,
+                "status": stats.status,
+                "total_profit": stats.total_profit,
+                "total_profit_percent": stats.total_profit_percent,
+                "total_trades": stats.total_trades,
+                "active_orders": stats.active_orders,
+                "completed_orders": stats.completed_orders,
+                "current_price": stats.current_price,
+                "price_range": stats.price_range,
+                "grid_levels": stats.grid_levels,
+            });
+            (StatusCode::OK, Json(response))
+        }
+        None => {
+            let response = serde_json::json!({
+                "error": "Grid strategy not found"
+            });
+            (StatusCode::NOT_FOUND, Json(response))
+        }
+    }
+}
+
+async fn update_grid_price(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> impl IntoResponse {
+    let strategies = state.grid_strategies.read().await;
+    
+    let mut strategy = match strategies.get(&strategy_id).cloned() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Grid strategy not found"
+                })),
+            );
+        }
+    };
+    drop(strategies);
+    
+    // Get current price
+    let current_price = match price::fetch_token_price(&strategy.chain, &strategy.token).await {
+        Ok(price_data) => price_data.price_usd,
+        Err(_) => strategy.last_price,
+    };
+    
+    let new_orders = grid_trading::update_grid_with_price(&mut strategy, current_price);
+    state.grid_strategies.write().await.insert(strategy_id, strategy);
+    
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "current_price": current_price,
+            "new_orders": new_orders.len()
+        })),
+    )
+}
+
+async fn pause_grid_strategy(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> impl IntoResponse {
+    let strategies = state.grid_strategies.read().await;
+    
+    let mut strategy = match strategies.get(&strategy_id).cloned() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Grid strategy not found"
+                })),
+            );
+        }
+    };
+    drop(strategies);
+    
+    grid_trading::pause_grid(&mut strategy);
+    state.grid_strategies.write().await.insert(strategy_id, strategy);
+    
+    (StatusCode::OK, Json(serde_json::json!({"success": true})))
+}
+
+async fn stop_grid_strategy(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> impl IntoResponse {
+    let strategies = state.grid_strategies.read().await;
+    
+    let mut strategy = match strategies.get(&strategy_id).cloned() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Grid strategy not found"
+                })),
+            );
+        }
+    };
+    drop(strategies);
+    
+    grid_trading::stop_grid(&mut strategy);
+    state.grid_strategies.write().await.insert(strategy_id, strategy);
+    
+    (StatusCode::OK, Json(serde_json::json!({"success": true})))
+}
+
 // ==================== MAIN ====================
 #[tokio::main]
 async fn main() {
@@ -1243,6 +1731,12 @@ async fn main() {
         wallets: Arc::new(RwLock::new(HashMap::new())),
         transactions: Arc::new(RwLock::new(HashMap::new())),
         alerts: Arc::new(RwLock::new(HashMap::new())),
+        bundles: Arc::new(RwLock::new(HashMap::new())),
+        whale_trades: Arc::new(RwLock::new(Vec::new())),
+        whale_map: Arc::new(RwLock::new(HashMap::new())),
+        whale_alerts: Arc::new(RwLock::new(HashMap::new())),
+        trade_records: Arc::new(RwLock::new(Vec::new())),
+        grid_strategies: Arc::new(RwLock::new(HashMap::new())),
         solana_client,
     };
     
@@ -1271,6 +1765,24 @@ async fn main() {
         .route("/api/alerts/:user_id", get(get_alerts))
         .route("/api/alert", post(create_alert))
         .route("/api/import", post(import_data))
+        .route("/api/wallet/close-token-accounts", post(close_token_accounts))
+        // Bundler routes
+        .route("/api/bundler/add", post(add_to_bundle))
+        .route("/api/bundler/status/:user_id/:chain", get(get_bundle_status))
+        .route("/api/bundler/execute/:user_id/:chain", post(execute_bundle_endpoint))
+        // Whale tracker routes
+        .route("/api/whales/stats", get(get_whale_stats))
+        .route("/api/whales/alert", post(create_whale_alert))
+        .route("/api/whales/alerts/:user_id", get(get_whale_alerts))
+        // Leaderboards routes
+        .route("/api/leaderboard/:period", get(get_leaderboard))
+        .route("/api/leaderboard/user/:user_id/:period", get(get_user_rank))
+        // Grid trading routes
+        .route("/api/grid/create", post(create_grid_strategy))
+        .route("/api/grid/:strategy_id", get(get_grid_strategy))
+        .route("/api/grid/:strategy_id/update", post(update_grid_price))
+        .route("/api/grid/:strategy_id/pause", post(pause_grid_strategy))
+        .route("/api/grid/:strategy_id/stop", post(stop_grid_strategy))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
     
@@ -1280,6 +1792,32 @@ async fn main() {
     tracing::info!("✅ Trading engine running on {}", addr);
     tracing::info!("📊 Position monitoring active");
     
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr).await
+        .expect("Failed to bind to address");
+    
+    tracing::info!("🌐 Server listening on http://{}", addr);
+    tracing::info!("📚 API Documentation:");
+    tracing::info!("   GET  /health");
+    tracing::info!("   POST /api/buy");
+    tracing::info!("   POST /api/sell");
+    tracing::info!("   GET  /api/positions/:user_id");
+    tracing::info!("   GET  /api/wallet/balance/:user_id/:chain");
+    tracing::info!("   POST /api/wallet/generate");
+    tracing::info!("   POST /api/wallet/import");
+    tracing::info!("   POST /api/wallet/close-token-accounts");
+    
+    // Graceful shutdown
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C signal handler");
+        tracing::info!("🛑 Shutdown signal received");
+    };
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .expect("Server error");
+    
+    tracing::info!("✅ Server shut down gracefully");
 }

@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # Rust Trading Engine
+  trading-engine:
+    build:
+      context: ./trading-engine
+      dockerfile: Dockerfile
+    container_name: trading_engine
+    environment:
+      - SOLANA_RPC=${SOLANA_RPC:-https://api.mainnet-beta.solana.com}
+      - PORT=3000
+      - RUST_LOG=info
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Telegram Bot
+  telegram-bot:
+    build:
+      context: ./telegram-bot
+      dockerfile: Dockerfile
+    container_name: telegram_bot
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - RUST_API_URL=http://trading-engine:3000
+    depends_on:
+      - trading-engine
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redis-data:
