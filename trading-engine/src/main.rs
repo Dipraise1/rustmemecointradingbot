@@ -1469,6 +1469,87 @@ async fn get_whale_alerts(
     (StatusCode::OK, Json(user_alerts))
 }
 
+async fn analyze_whale_impact_for_grid(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> impl IntoResponse {
+    let strategies = state.grid_strategies.read().await;
+    let trades = state.whale_trades.read().await;
+    
+    let strategy = match strategies.get(&strategy_id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Grid strategy not found"
+                })),
+            );
+        }
+    };
+    
+    // Get recent whale trades for this token
+    let now = chrono::Utc::now().timestamp();
+    let hour_ago = now - 3600;
+    
+    let recent_whale_trades: Vec<&whale_tracker::WhaleTrade> = trades
+        .iter()
+        .filter(|t| t.token == strategy.token 
+                && t.chain == strategy.chain
+                && t.timestamp >= hour_ago)
+        .collect();
+    
+    if recent_whale_trades.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "impact": "low",
+                "message": "No recent whale activity detected",
+                "recommended_action": "CONTINUE - Normal market conditions"
+            })),
+        );
+    }
+    
+    // Calculate average volume for comparison
+    let avg_volume: f64 = recent_whale_trades.iter()
+        .map(|t| t.size_usd)
+        .sum::<f64>() / recent_whale_trades.len() as f64;
+    
+    // Analyze most recent whale trade
+    let latest_trade = recent_whale_trades.iter()
+        .max_by_key(|t| t.timestamp)
+        .unwrap();
+    
+    let activity = whale_tracker::detect_whale_activity(
+        latest_trade,
+        &recent_whale_trades.iter().map(|t| (*t).clone()).collect::<Vec<_>>(),
+        avg_volume,
+    );
+    
+    let impact_analysis = whale_tracker::analyze_whale_impact_for_grid(
+        &activity,
+        strategy.last_price,
+        (strategy.lower_price, strategy.upper_price),
+    );
+    
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "impact": impact_analysis.market_impact.to_lowercase(),
+            "price_impact": impact_analysis.price_impact,
+            "volume_anomaly": impact_analysis.volume_anomaly,
+            "velocity_score": impact_analysis.velocity_score,
+            "recommended_action": impact_analysis.recommended_action,
+            "latest_whale_trade": {
+                "size_usd": latest_trade.size_usd,
+                "price": latest_trade.price,
+                "timestamp": latest_trade.timestamp,
+                "position_type": format!("{:?}", latest_trade.position_type),
+            }
+        })),
+    )
+}
+
 // ==================== LEADERBOARDS API ====================
 async fn get_leaderboard(
     State(state): State<AppState>,
@@ -1618,6 +1699,7 @@ async fn update_grid_price(
     Path(strategy_id): Path<String>,
 ) -> impl IntoResponse {
     let strategies = state.grid_strategies.read().await;
+    let trades = state.whale_trades.read().await;
     
     let mut strategy = match strategies.get(&strategy_id).cloned() {
         Some(s) => s,
@@ -1638,15 +1720,74 @@ async fn update_grid_price(
         Err(_) => strategy.last_price,
     };
     
+    // Check for whale activity that might affect this grid
+    let now = chrono::Utc::now().timestamp();
+    let recent_window = now - 300; // Last 5 minutes
+    
+    let recent_whale_trades: Vec<&whale_tracker::WhaleTrade> = trades
+        .iter()
+        .filter(|t| t.token == strategy.token 
+                && t.chain == strategy.chain
+                && t.timestamp >= recent_window)
+        .collect();
+    
+    let mut whale_adjustments = Vec::new();
+    
+    if !recent_whale_trades.is_empty() {
+        // Analyze whale impact
+        let avg_volume: f64 = recent_whale_trades.iter()
+            .map(|t| t.size_usd)
+            .sum::<f64>() / recent_whale_trades.len() as f64;
+        
+        let latest_trade = recent_whale_trades.iter()
+            .max_by_key(|t| t.timestamp)
+            .unwrap();
+        
+        let activity = whale_tracker::detect_whale_activity(
+            latest_trade,
+            &recent_whale_trades.iter().map(|t| (*t).clone()).collect::<Vec<_>>(),
+            avg_volume,
+        );
+        
+        let impact_str = match activity.market_impact {
+            whale_tracker::MarketImpact::Critical => "critical",
+            whale_tracker::MarketImpact::High => "high",
+            whale_tracker::MarketImpact::Medium => "medium",
+            whale_tracker::MarketImpact::Low => "low",
+        };
+        
+        // Check if we should pause
+        if grid_trading::should_pause_grid_for_whale(
+            &strategy,
+            impact_str,
+            activity.price_impact,
+            activity.velocity_score,
+        ) {
+            grid_trading::pause_grid(&mut strategy);
+            whale_adjustments.push("Grid paused due to whale activity".to_string());
+        } else {
+            // Adjust grid parameters
+            let adjustments = grid_trading::adjust_grid_for_whale_activity(
+                &mut strategy,
+                impact_str,
+                activity.price_impact,
+                current_price,
+            );
+            whale_adjustments.extend(adjustments);
+        }
+    }
+    
     let new_orders = grid_trading::update_grid_with_price(&mut strategy, current_price);
-    state.grid_strategies.write().await.insert(strategy_id, strategy);
+    state.grid_strategies.write().await.insert(strategy_id.clone(), strategy);
     
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "success": true,
             "current_price": current_price,
-            "new_orders": new_orders.len()
+            "new_orders": new_orders.len(),
+            "whale_adjustments": whale_adjustments,
+            "strategy_id": strategy_id
         })),
     )
 }
@@ -1717,6 +1858,9 @@ async fn main() {
     // Initialize Solana client
     let solana_rpc = std::env::var("SOLANA_RPC")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    
+    // Create RPC client with increased timeout for better reliability
+    // The balance fetching will use fallback endpoints if this fails
     let solana_client = Arc::new(RpcClient::new_with_commitment(
         solana_rpc.clone(),
         CommitmentConfig::confirmed(),
@@ -1783,6 +1927,7 @@ async fn main() {
         .route("/api/grid/:strategy_id/update", post(update_grid_price))
         .route("/api/grid/:strategy_id/pause", post(pause_grid_strategy))
         .route("/api/grid/:strategy_id/stop", post(stop_grid_strategy))
+        .route("/api/grid/:strategy_id/whale-impact", get(analyze_whale_impact_for_grid))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
     

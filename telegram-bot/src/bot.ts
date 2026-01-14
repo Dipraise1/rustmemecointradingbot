@@ -76,6 +76,26 @@ bot.use(session({
 }));
 
 // ==================== HELPER FUNCTIONS ====================
+// Helper function to safely edit messages (handles "message not modified" error)
+async function safeEditMessage(ctx: MyContext, text: string, options?: any) {
+  try {
+    await ctx.editMessageText(text, options);
+  } catch (error: any) {
+    // Ignore "message is not modified" error - it means the message is already correct
+    if (error.error_code === 400 && error.description?.includes('message is not modified')) {
+      // Message is already correct, no need to update
+      return;
+    }
+    // For other errors, try to reply instead
+    try {
+      await ctx.reply(text, options);
+    } catch (replyError) {
+      // If reply also fails, just log it
+      console.error('Failed to edit or reply:', replyError);
+    }
+  }
+}
+
 async function callRustAPI(endpoint: string, method: string = 'GET', body?: any, timeout: number = 30000) {
   try {
     const controller = new AbortController();
@@ -109,19 +129,47 @@ async function callRustAPI(endpoint: string, method: string = 'GET', body?: any,
   }
 }
 
+// ==================== KEYBOARD LAYOUTS ====================
+// All buttons arranged horizontally in rows of 3 - All main features visible
 function getMainKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text('💼 Wallet', 'wallet')
-    .text('💰 Buy', 'buy').row()
+    .text('💰 Buy', 'buy')
     .text('📊 Positions', 'positions')
     .text('📈 Portfolio', 'portfolio').row()
     .text('📦 Bundler', 'bundler')
-    .text('🐋 Whales', 'whales').row()
-    .text('🏆 Leaderboard', 'leaderboard')
+    .text('🐋 Whales', 'whales')
     .text('📐 Grid Trading', 'grid_trading').row()
-    .text('📥 Import', 'import_data')
+    .text('🏆 Leaderboard', 'leaderboard')
+    .text('💼 Wallet', 'wallet')
     .text('⚙️ Settings', 'settings').row()
-    .text('🔍 Check Token', 'check_token');
+    .text('🔍 Check Token', 'check_token')
+    .text('📥 Import', 'import_data').row();
+}
+
+function getTradingMenuKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('💰 Buy Token', 'buy')
+    .text('📊 Positions', 'positions')
+    .text('📈 Portfolio', 'portfolio').row()
+    .text('🔙 Back', 'back_main').row();
+}
+
+function getToolsMenuKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('📦 Bundler', 'bundler')
+    .text('🐋 Whales', 'whales')
+    .text('📐 Grid Trading', 'grid_trading').row()
+    .text('🏆 Leaderboard', 'leaderboard')
+    .text('🔍 Check Token', 'check_token')
+    .text('🔙 Back', 'back_main').row();
+}
+
+function getWalletMenuKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('💼 View Wallets', 'wallet')
+    .text('🔐 Generate', 'generate_wallet')
+    .text('📥 Import', 'import_wallet').row()
+    .text('🔙 Back', 'back_main').row();
 }
 
 // Portfolio button
@@ -146,10 +194,11 @@ bot.callbackQuery('portfolio', async (ctx) => {
     
     const keyboard = new InlineKeyboard()
       .text('💼 Wallets', 'wallet')
-      .text('📊 Positions', 'positions').row()
+      .text('📊 Positions', 'positions')
+      .text('💰 Trading', 'menu_trading').row()
       .text('🔙 Back', 'back_main');
     
-    await ctx.editMessageText(message, { parse_mode: 'HTML', reply_markup: keyboard });
+    await safeEditMessage(ctx, message, { parse_mode: 'HTML', reply_markup: keyboard });
   } catch (error: any) {
     await ctx.editMessageText(`❌ Error: ${error.message}`, { parse_mode: 'HTML' });
   }
@@ -297,6 +346,17 @@ bot.command('start', async (ctx) => {
 • Solana (SOL)
 • Ethereum (ETH)
 • Binance Smart Chain (BSC)
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>All Features Available:</b>
+• <b>Buy:</b> Purchase tokens
+• <b>Positions:</b> View active trades
+• <b>Portfolio:</b> Complete holdings overview
+• <b>Bundler:</b> Save gas with transaction bundling
+• <b>Whales:</b> Track large trades
+• <b>Grid Trading:</b> Automated grid strategy
+• <b>Leaderboard:</b> Top traders rankings
 
 Get started by creating your wallet 👇
       `;
@@ -1129,10 +1189,11 @@ bot.callbackQuery('buy', async (ctx) => {
     if (!hasWallet) {
       const keyboard = new InlineKeyboard()
         .text('🔐 Generate Wallet', 'generate_wallet')
-        .text('📥 Import Wallet', 'import_wallet').row()
-        .text('🔙 Back', 'back_main');
+        .text('📥 Import Wallet', 'import_wallet')
+        .text('🔙 Back', 'menu_trading').row();
       
-      await ctx.editMessageText(
+      await safeEditMessage(
+        ctx,
         '❌ <b>Wallet Required</b>\n\n' +
         `You need to setup a ${defaultChain.toUpperCase()} wallet before buying.\n\n` +
         'Please create or import a wallet first:',
@@ -1142,7 +1203,11 @@ bot.callbackQuery('buy', async (ctx) => {
     }
     
     ctx.session.awaitingInput = 'buy';
-    await ctx.editMessageText(
+    const keyboard = new InlineKeyboard()
+      .text('🔙 Back', 'menu_trading');
+    
+    await safeEditMessage(
+      ctx,
       '💰 <b>Quick Buy</b>\n\n' +
       '━━━━━━━━━━━━━━━━━━━━\n\n' +
       '🔒 <b>Secure Trading Interface</b>\n\n' +
@@ -1151,7 +1216,7 @@ bot.callbackQuery('buy', async (ctx) => {
       '📝 <b>Send token address:</b>\n\n' +
       '💡 <b>Example:</b>\n' +
       '<code>2tJU3pMh4HJjKa9HN6HngdopfNqqaeEytFqW98Kqpump</code>',
-      { parse_mode: 'HTML' }
+      { parse_mode: 'HTML', reply_markup: keyboard }
     );
   } catch (error: any) {
     await ctx.reply(`❌ Error checking wallet: ${error.message}`);
@@ -1162,7 +1227,7 @@ bot.callbackQuery('buy', async (ctx) => {
 bot.callbackQuery('positions', async (ctx) => {
   await ctx.answerCallbackQuery();
   
-  await ctx.editMessageText('📊 <b>Fetching positions...</b>', { parse_mode: 'HTML' });
+  await safeEditMessage(ctx, '📊 <b>Fetching positions...</b>', { parse_mode: 'HTML' });
   
   try {
     const positions: Position[] = await callRustAPI(
@@ -1171,10 +1236,12 @@ bot.callbackQuery('positions', async (ctx) => {
     
     if (positions.length === 0) {
       const keyboard = new InlineKeyboard()
-        .text('💰 Buy Tokens', 'buy').row()
-        .text('🔙 Back', 'back_main');
+        .text('💰 Buy Tokens', 'buy')
+        .text('📈 Portfolio', 'portfolio')
+        .text('🔙 Back', 'menu_trading').row();
       
-      await ctx.editMessageText(
+      await safeEditMessage(
+        ctx,
         '📭 <b>No Active Positions</b>\n\n' +
         'You don\'t have any open positions yet.\n\n' +
         'Start trading to see your positions here.',
@@ -1201,10 +1268,12 @@ bot.callbackQuery('positions', async (ctx) => {
     }
     
     const keyboard = new InlineKeyboard()
-      .text('🔄 Refresh', 'positions').row()
-      .text('🔙 Back', 'back_main');
+      .text('🔄 Refresh', 'positions')
+      .text('💰 Buy', 'buy')
+      .text('📈 Portfolio', 'portfolio').row()
+      .text('🔙 Back', 'menu_trading').row();
     
-    await ctx.editMessageText(message, { parse_mode: 'HTML', reply_markup: keyboard });
+    await safeEditMessage(ctx, message, { parse_mode: 'HTML', reply_markup: keyboard });
   } catch (error: any) {
     await ctx.editMessageText(`❌ Error: ${error.message}`, { parse_mode: 'HTML' });
   }
@@ -1610,13 +1679,58 @@ bot.callbackQuery('cancel_buy', async (ctx) => {
   await ctx.editMessageText('❌ Buy cancelled.', { parse_mode: 'HTML' });
 });
 
+// ==================== MENU HANDLERS ====================
+// Trading menu
+bot.callbackQuery('menu_trading', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await safeEditMessage(
+    ctx,
+    '💰 <b>Trading Menu</b>\n\n' +
+    '━━━━━━━━━━━━━━━━━━━━\n\n' +
+    '• <b>Buy Token:</b> Purchase tokens on any chain\n' +
+    '• <b>Positions:</b> View your active positions\n' +
+    '• <b>Portfolio:</b> See your complete portfolio\n\n' +
+    'Select an option below:',
+    { parse_mode: 'HTML', reply_markup: getTradingMenuKeyboard() }
+  );
+});
+
+// Tools menu
+bot.callbackQuery('menu_tools', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await safeEditMessage(
+    ctx,
+    '🛠️ <b>Tools & Features</b>\n\n' +
+    '━━━━━━━━━━━━━━━━━━━━\n\n' +
+    '• <b>Bundler:</b> Bundle transactions to save gas\n' +
+    '• <b>Whales:</b> Track large trades and alerts\n' +
+    '• <b>Grid Trading:</b> Automated grid strategy\n' +
+    '• <b>Leaderboard:</b> Top traders rankings\n' +
+    '• <b>Check Token:</b> Security analysis\n\n' +
+    'Select a tool:',
+    { parse_mode: 'HTML', reply_markup: getToolsMenuKeyboard() }
+  );
+});
+
 // Back to main
 bot.callbackQuery('back_main', async (ctx) => {
   await ctx.answerCallbackQuery();
   ctx.session.pendingBuy = undefined;
   ctx.session.awaitingInput = undefined;
-  await ctx.editMessageText(
-    '🤖 <b>Main Menu</b>\n\nWhat would you like to do?',
+  await safeEditMessage(
+    ctx,
+    '🤖 <b>Main Menu</b>\n\n' +
+    '━━━━━━━━━━━━━━━━━━━━\n\n' +
+    'Welcome! All features are available below:\n\n' +
+    '• <b>Buy:</b> Purchase tokens\n' +
+    '• <b>Positions:</b> View active trades\n' +
+    '• <b>Portfolio:</b> Complete holdings overview\n' +
+    '• <b>Bundler:</b> Save gas with transaction bundling\n' +
+    '• <b>Whales:</b> Track large trades\n' +
+    '• <b>Grid Trading:</b> Automated grid strategy\n' +
+    '• <b>Leaderboard:</b> Top traders rankings\n' +
+    '• <b>Wallet:</b> Manage your wallets\n' +
+    '• <b>Settings:</b> Configure preferences',
     { parse_mode: 'HTML', reply_markup: getMainKeyboard() }
   );
 });
@@ -2627,11 +2741,12 @@ bot.callbackQuery('bundler', async (ctx) => {
   
   const keyboard = new InlineKeyboard()
     .text('➕ Add Transaction', 'bundler_add')
-    .text('📊 View Bundle', 'bundler_status').row()
-    .text('⚡ Execute Bundle', 'bundler_execute')
-    .text('🔙 Back', 'back_main');
+    .text('📊 View Bundle', 'bundler_status')
+    .text('⚡ Execute', 'bundler_execute').row()
+    .text('🔙 Back', 'menu_tools').row();
   
-  await ctx.editMessageText(
+  await safeEditMessage(
+    ctx,
     '📦 <b>Transaction Bundler</b>\n\n' +
     '━━━━━━━━━━━━━━━━━━━━\n\n' +
     'Bundle multiple transactions together to save on gas fees!\n\n' +
@@ -2697,12 +2812,28 @@ bot.callbackQuery(/^bundler_execute/, async (ctx) => {
   
   try {
     const settings = ctx.session.settings;
-    await ctx.editMessageText('⚡ <b>Executing bundle...</b>', { parse_mode: 'HTML' });
+    await safeEditMessage(ctx, '⚡ <b>Executing bundle...</b>', { parse_mode: 'HTML' });
+    
+    // First check if bundle exists
+    const bundleStatus = await callRustAPI(`/api/bundler/status/${ctx.from!.id}/${settings.defaultChain}`, 'GET').catch(() => null);
+    
+    if (!bundleStatus || bundleStatus.transaction_count === 0) {
+      await safeEditMessage(
+        ctx,
+        `❌ <b>No Bundle Found</b>\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `You need to add transactions to a bundle first.\n\n` +
+        `Use the "Add to Bundle" option when buying/selling.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
     
     const result = await callRustAPI(`/api/bundler/execute/${ctx.from!.id}/${settings.defaultChain}`, 'POST');
     
     if (result.success) {
-      await ctx.editMessageText(
+      await safeEditMessage(
+        ctx,
         `✅ <b>Bundle Executed!</b>\n\n` +
         `━━━━━━━━━━━━━━━━━━━━\n\n` +
         `🔗 <b>TX Hash:</b>\n` +
@@ -2711,10 +2842,33 @@ bot.callbackQuery(/^bundler_execute/, async (ctx) => {
         { parse_mode: 'HTML' }
       );
     } else {
-      await ctx.editMessageText(`❌ Error: ${result.error}`, { parse_mode: 'HTML' });
+      await safeEditMessage(
+        ctx,
+        `❌ <b>Bundle Execution Failed</b>\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Error: ${result.error || 'Unknown error'}\n\n` +
+        `Make sure you have transactions in your bundle.`,
+        { parse_mode: 'HTML' }
+      );
     }
   } catch (error: any) {
-    await ctx.editMessageText(`❌ Error: ${error.message}`, { parse_mode: 'HTML' });
+    const errorMessage = error.message || 'Unknown error';
+    if (errorMessage.includes('404') || errorMessage.includes('Bundle not found')) {
+      await safeEditMessage(
+        ctx,
+        `❌ <b>No Bundle Found</b>\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `You need to add transactions to a bundle first.\n\n` +
+        `Use the "Add to Bundle" option when buying/selling.`,
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      await safeEditMessage(
+        ctx,
+        `❌ <b>Error</b>\n\n${errorMessage}`,
+        { parse_mode: 'HTML' }
+      );
+    }
   }
 });
 
@@ -2747,11 +2901,11 @@ bot.callbackQuery('whales', async (ctx) => {
     
     const keyboard = new InlineKeyboard()
       .text('🔔 Create Alert', 'whale_alert_create')
-      .text('📋 My Alerts', 'whale_alerts').row()
-      .text('🔄 Refresh', 'whales')
-      .text('🔙 Back', 'back_main');
+      .text('📋 My Alerts', 'whale_alerts')
+      .text('🔄 Refresh', 'whales').row()
+      .text('🔙 Back', 'menu_tools').row();
     
-    await ctx.editMessageText(message, { parse_mode: 'HTML', reply_markup: keyboard });
+    await safeEditMessage(ctx, message, { parse_mode: 'HTML', reply_markup: keyboard });
   } catch (error: any) {
     await ctx.editMessageText(`❌ Error: ${error.message}`, { parse_mode: 'HTML' });
   }
@@ -2814,13 +2968,14 @@ bot.callbackQuery('leaderboard', async (ctx) => {
   
   const keyboard = new InlineKeyboard()
     .text('📅 Daily', 'leaderboard_daily')
-    .text('📆 Weekly', 'leaderboard_weekly').row()
-    .text('📊 Monthly', 'leaderboard_monthly')
-    .text('🏆 All Time', 'leaderboard_alltime').row()
+    .text('📆 Weekly', 'leaderboard_weekly')
+    .text('📊 Monthly', 'leaderboard_monthly').row()
+    .text('🏆 All Time', 'leaderboard_alltime')
     .text('👤 My Rank', 'leaderboard_myrank')
-    .text('🔙 Back', 'back_main');
+    .text('🔙 Back', 'menu_tools').row();
   
-  await ctx.editMessageText(
+  await safeEditMessage(
+    ctx,
     '🏆 <b>Leaderboards</b>\n\n' +
     '━━━━━━━━━━━━━━━━━━━━\n\n' +
     'View top traders ranked by performance!\n\n' +
@@ -2855,9 +3010,10 @@ bot.callbackQuery(/^leaderboard_(daily|weekly|monthly|alltime)$/, async (ctx) =>
     
     const keyboard = new InlineKeyboard()
       .text('🔄 Refresh', `leaderboard_${period}`)
-      .text('🔙 Back', 'leaderboard');
+      .text('👤 My Rank', 'leaderboard_myrank')
+      .text('🔙 Back', 'leaderboard').row();
     
-    await ctx.editMessageText(message, { parse_mode: 'HTML', reply_markup: keyboard });
+    await safeEditMessage(ctx, message, { parse_mode: 'HTML', reply_markup: keyboard });
   } catch (error: any) {
     await ctx.editMessageText(`❌ Error: ${error.message}`, { parse_mode: 'HTML' });
   }
@@ -2913,10 +3069,11 @@ bot.callbackQuery('grid_trading', async (ctx) => {
   
   const keyboard = new InlineKeyboard()
     .text('➕ Create Grid', 'grid_create')
-    .text('📊 My Grids', 'grid_list').row()
-    .text('🔙 Back', 'back_main');
+    .text('📊 My Grids', 'grid_list')
+    .text('🔙 Back', 'menu_tools').row();
   
-  await ctx.editMessageText(
+  await safeEditMessage(
+    ctx,
     '📐 <b>Grid Trading</b>\n\n' +
     '━━━━━━━━━━━━━━━━━━━━\n\n' +
     'Automated trading strategy for sideways markets!\n\n' +
@@ -2934,7 +3091,8 @@ bot.callbackQuery('grid_create', async (ctx) => {
   await ctx.answerCallbackQuery();
   ctx.session.awaitingInput = 'grid_create';
   
-  await ctx.editMessageText(
+  await safeEditMessage(
+    ctx,
     '➕ <b>Create Grid Strategy</b>\n\n' +
     'Send grid configuration:\n\n' +
     'Format: <code>&lt;token&gt; &lt;lower_price&gt; &lt;upper_price&gt; &lt;grid_count&gt; &lt;investment&gt;</code>\n\n' +

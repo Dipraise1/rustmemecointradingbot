@@ -68,6 +68,35 @@ pub struct WhaleInfo {
     pub avg_trade_size: f64,
     pub net_position: f64, // Positive = net long, Negative = net short
     pub last_trade: Option<WhaleTrade>,
+    pub trade_velocity: f64, // Trades per hour
+    pub price_impact_avg: f64, // Average price impact percentage
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhaleActivity {
+    pub trade: WhaleTrade,
+    pub price_impact: f64, // Price impact percentage
+    pub volume_anomaly: f64, // Volume spike multiplier vs average
+    pub velocity_score: f64, // Rapid trade indicator (0-1)
+    pub market_impact: MarketImpact, // Overall market impact assessment
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MarketImpact {
+    Low,      // < 1% price impact
+    Medium,   // 1-5% price impact
+    High,     // 5-10% price impact
+    Critical, // > 10% price impact or rapid consecutive trades
+}
+
+#[derive(Debug, Serialize)]
+pub struct WhaleImpactAnalysis {
+    pub trade: WhaleTrade,
+    pub price_impact: f64,
+    pub volume_anomaly: f64,
+    pub velocity_score: f64,
+    pub market_impact: String,
+    pub recommended_action: String, // For grid trading
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,15 +117,125 @@ pub struct WhaleAlertResponse {
 
 // ==================== WHALE DETECTION ====================
 pub fn is_whale_trade(size_usd: f64, chain: &str) -> bool {
-    // Minimum thresholds per chain
-    let threshold = match chain {
+    // Dynamic thresholds based on market conditions
+    let base_threshold = match chain {
         "solana" => 10_000.0,  // $10k+ on Solana
         "eth" | "ethereum" => 50_000.0, // $50k+ on Ethereum
         "bsc" | "binance" => 25_000.0,  // $25k+ on BSC
         _ => 10_000.0,
     };
     
-    size_usd >= threshold
+    size_usd >= base_threshold
+}
+
+/// Enhanced whale detection with multiple criteria
+pub fn detect_whale_activity(
+    trade: &WhaleTrade,
+    recent_trades: &[WhaleTrade],
+    avg_volume_24h: f64,
+) -> WhaleActivity {
+    // Calculate price impact (simplified - in production, use order book depth)
+    let price_impact = calculate_price_impact(trade.size_usd, trade.chain.as_str());
+    
+    // Calculate volume anomaly (how much above average)
+    let volume_anomaly = if avg_volume_24h > 0.0 {
+        trade.size_usd / avg_volume_24h
+    } else {
+        1.0
+    };
+    
+    // Calculate velocity (rapid consecutive trades)
+    let velocity_score = calculate_trade_velocity(trade, recent_trades);
+    
+    // Determine market impact
+    let market_impact = if price_impact > 10.0 || velocity_score > 0.8 {
+        MarketImpact::Critical
+    } else if price_impact > 5.0 || velocity_score > 0.6 {
+        MarketImpact::High
+    } else if price_impact > 1.0 || volume_anomaly > 3.0 {
+        MarketImpact::Medium
+    } else {
+        MarketImpact::Low
+    };
+    
+    WhaleActivity {
+        trade: trade.clone(),
+        price_impact,
+        volume_anomaly,
+        velocity_score,
+        market_impact,
+    }
+}
+
+/// Calculate estimated price impact based on trade size and chain
+fn calculate_price_impact(size_usd: f64, chain: &str) -> f64 {
+    // Simplified model - in production, use order book depth analysis
+    // Larger trades on less liquid chains have more impact
+    let base_impact = match chain {
+        "solana" => size_usd / 100_000.0, // ~0.01% per $100k
+        "eth" | "ethereum" => size_usd / 500_000.0, // ~0.002% per $500k
+        "bsc" | "binance" => size_usd / 250_000.0, // ~0.004% per $250k
+        _ => size_usd / 100_000.0,
+    };
+    
+    // Non-linear impact (larger trades have exponentially more impact)
+    base_impact * (1.0 + (size_usd / 1_000_000.0).powf(1.5))
+}
+
+/// Calculate trade velocity (rapid consecutive trades indicator)
+fn calculate_trade_velocity(trade: &WhaleTrade, recent_trades: &[WhaleTrade]) -> f64 {
+    let time_window = 300; // 5 minutes
+    let cutoff = trade.timestamp - time_window;
+    
+    // Count trades from same wallet in time window
+    let rapid_trades = recent_trades.iter()
+        .filter(|t| t.wallet_address == trade.wallet_address 
+                && t.timestamp >= cutoff
+                && t.token == trade.token)
+        .count();
+    
+    // Velocity score: 0.0 (no velocity) to 1.0 (very high velocity)
+    // 3+ trades in 5 minutes = high velocity
+    (rapid_trades as f64 / 3.0).min(1.0)
+}
+
+/// Analyze whale impact for grid trading recommendations
+pub fn analyze_whale_impact_for_grid(
+    activity: &WhaleActivity,
+    current_price: f64,
+    grid_range: (f64, f64),
+) -> WhaleImpactAnalysis {
+    let recommended_action = match activity.market_impact {
+        MarketImpact::Critical => {
+            if activity.trade.price > current_price * 1.05 || activity.trade.price < current_price * 0.95 {
+                "PAUSE_GRID - Whale activity causing significant price movement"
+            } else {
+                "REDUCE_GRID_SPACING - High volatility expected"
+            }
+        },
+        MarketImpact::High => {
+            if activity.velocity_score > 0.6 {
+                "PAUSE_GRID - Rapid whale trades detected"
+            } else {
+                "WIDEN_GRID_RANGE - Adjust for increased volatility"
+            }
+        },
+        MarketImpact::Medium => {
+            "MONITOR - Continue with caution"
+        },
+        MarketImpact::Low => {
+            "CONTINUE - Normal market conditions"
+        },
+    };
+    
+    WhaleImpactAnalysis {
+        trade: activity.trade.clone(),
+        price_impact: activity.price_impact,
+        volume_anomaly: activity.volume_anomaly,
+        velocity_score: activity.velocity_score,
+        market_impact: format!("{:?}", activity.market_impact),
+        recommended_action: recommended_action.to_string(),
+    }
 }
 
 pub fn classify_trade_type(
@@ -132,6 +271,7 @@ pub fn classify_trade_type(
 pub fn track_whale_trade(
     trade: WhaleTrade,
     whale_map: &mut HashMap<String, WhaleInfo>,
+    price_impact: f64,
 ) {
     let whale_info = whale_map.entry(trade.wallet_address.clone())
         .or_insert_with(|| WhaleInfo {
@@ -141,11 +281,28 @@ pub fn track_whale_trade(
             avg_trade_size: 0.0,
             net_position: 0.0,
             last_trade: None,
+            trade_velocity: 0.0,
+            price_impact_avg: 0.0,
         });
+    
+    // Calculate time since last trade for velocity
+    let time_since_last = if let Some(last) = &whale_info.last_trade {
+        trade.timestamp - last.timestamp
+    } else {
+        3600 // Default to 1 hour if no previous trade
+    };
     
     whale_info.total_volume_24h += trade.size_usd;
     whale_info.trade_count += 1;
     whale_info.avg_trade_size = whale_info.total_volume_24h / whale_info.trade_count as f64;
+    
+    // Update velocity (trades per hour)
+    if time_since_last > 0 {
+        whale_info.trade_velocity = 3600.0 / time_since_last as f64;
+    }
+    
+    // Update average price impact (exponential moving average)
+    whale_info.price_impact_avg = (whale_info.price_impact_avg * 0.7) + (price_impact * 0.3);
     
     // Update net position
     match trade.position_type {

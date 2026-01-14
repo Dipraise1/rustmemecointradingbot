@@ -348,3 +348,90 @@ pub fn stop_grid(strategy: &mut GridStrategy) {
         }
     }
 }
+
+// ==================== WHALE INTEGRATION ====================
+/// Adjust grid strategy based on whale activity
+pub fn adjust_grid_for_whale_activity(
+    strategy: &mut GridStrategy,
+    whale_impact: &str, // "critical", "high", "medium", "low"
+    price_impact: f64,
+    current_price: f64,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    
+    match whale_impact {
+        "critical" => {
+            // Pause grid immediately
+            if matches!(strategy.status, GridStatus::Active) {
+                strategy.status = GridStatus::Paused;
+                actions.push("Grid paused due to critical whale activity".to_string());
+            }
+        },
+        "high" => {
+            // Widen grid spacing to handle volatility
+            let volatility_multiplier = 1.0 + (price_impact / 100.0).min(0.5); // Max 50% wider
+            strategy.grid_spacing *= volatility_multiplier;
+            
+            // Adjust price range if price moved significantly
+            let price_change_pct = ((current_price - strategy.last_price) / strategy.last_price).abs();
+            if price_change_pct > 0.05 { // 5% price change
+                // Expand range by 20%
+                let range_expansion = (strategy.upper_price - strategy.lower_price) * 0.2;
+                strategy.lower_price = (strategy.lower_price - range_expansion / 2.0).max(0.0);
+                strategy.upper_price += range_expansion / 2.0;
+                actions.push(format!("Grid range expanded by {:.2}% due to whale activity", price_change_pct * 100.0));
+            }
+            
+            actions.push("Grid spacing widened for high volatility".to_string());
+        },
+        "medium" => {
+            // Slightly widen spacing
+            strategy.grid_spacing *= 1.1; // 10% wider
+            actions.push("Grid spacing slightly widened".to_string());
+        },
+        _ => {
+            // Low impact - no changes needed
+        }
+    }
+    
+    actions
+}
+
+/// Check if grid should be paused based on whale activity
+pub fn should_pause_grid_for_whale(
+    strategy: &GridStrategy,
+    whale_impact: &str,
+    price_impact: f64,
+    velocity_score: f64,
+) -> bool {
+    match whale_impact {
+        "critical" => true,
+        "high" => {
+            // Pause if high velocity (rapid trades) or very high price impact
+            velocity_score > 0.7 || price_impact > 8.0
+        },
+        _ => false,
+    }
+}
+
+/// Dynamically adjust grid parameters based on market volatility from whale activity
+pub fn optimize_grid_for_volatility(
+    strategy: &mut GridStrategy,
+    avg_volatility: f64, // Average price movement percentage
+    whale_activity_level: f64, // 0.0 to 1.0
+) {
+    // Increase grid spacing in high volatility periods
+    let volatility_adjustment = 1.0 + (avg_volatility * whale_activity_level * 0.5);
+    strategy.grid_spacing *= volatility_adjustment;
+    
+    // Reduce number of active orders if volatility is extreme
+    if avg_volatility > 0.10 && whale_activity_level > 0.7 {
+        // Cancel some pending orders to reduce exposure
+        let orders_to_cancel = strategy.active_orders.len() / 4; // Cancel 25%
+        for (i, order) in strategy.active_orders.iter_mut().enumerate() {
+            if i < orders_to_cancel && matches!(order.status, OrderStatus::Pending) {
+                order.status = OrderStatus::Cancelled;
+            }
+        }
+    }
+}
