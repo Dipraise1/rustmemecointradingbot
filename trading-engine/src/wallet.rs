@@ -15,7 +15,7 @@ use chrono::Utc;
 use bip39::{Mnemonic, Language};
 
 // ==================== WALLET STRUCTURES ====================
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct WalletInfo {
     pub user_id: i64,
     pub chain: String,
@@ -196,104 +196,211 @@ pub fn get_evm_signing_key(encrypted_key: &str, user_id: i64) -> Result<SecretKe
         .map_err(|e| format!("Invalid secret key: {}", e))
 }
 
-// ==================== WALLET OPERATIONS ====================
-pub fn create_wallet_info(
-    user_id: i64,
-    chain: String,
-    address: String,
-    private_key: String,
-) -> WalletInfo {
-    let encrypted_key = encrypt_key(&private_key, user_id);
-    
-    WalletInfo {
-        user_id,
-        chain,
-        address,
-        encrypted_private_key: encrypted_key,
-        created_at: Utc::now().timestamp(),
-        balance: None,
-        last_updated: None,
-    }
-}
+// ... (previous imports)
+use axum::{
+    extract::{Path, State},  // Add State
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use sqlx::PgPool; // Add PgPool
+use crate::AppState; // Import AppState
 
-pub fn validate_wallet_format(chain: &str, private_key: &str) -> Result<(), String> {
-    match chain {
-        "solana" => {
-            let _ = bs58::decode(private_key)
-                .into_vec()
-                .map_err(|_| "Invalid Solana private key format (expected base58)")?;
-            Ok(())
-        }
-        "eth" | "ethereum" | "bsc" | "binance" => {
-            let key_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
-            let bytes = hex::decode(key_hex)
-                .map_err(|_| "Invalid EVM private key format (expected hex)")?;
-            if bytes.len() != 32 {
-                return Err("EVM private key must be 32 bytes".to_string());
-            }
-            Ok(())
-        }
+// ... (Previous structs remain same)
+
+// ==================== HANDLERS ====================
+
+pub async fn generate_wallet_handler(
+    State(state): State<AppState>,
+    Json(request): Json<GenerateWalletRequest>,
+) -> impl IntoResponse {
+    let user_id = request.user_id; // Just simple variable
+    
+    // Save user if not exists
+    let _ = sqlx::query("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING")
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
+
+    // Check existing wallet
+    let existing_wallet = sqlx::query("SELECT id FROM wallets WHERE user_id = $1 AND chain = $2")
+        .bind(user_id)
+        .bind(&request.chain)
+        .fetch_optional(&state.db)
+        .await;
+        
+    if let Ok(Some(_)) = existing_wallet {
+         return (
+            StatusCode::BAD_REQUEST,
+            Json(WalletResponse {
+                success: false,
+                address: None,
+                private_key: None,
+                mnemonic: None,
+                error: Some(format!("You already have a {} wallet", request.chain)),
+            }),
+        );
+    }
+
+    let result = match request.chain.as_str() {
+        "solana" | "sol" => generate_solana_wallet().map(|(a, p)| (a, p, None)),
+        "eth" | "ethereum" | "bsc" | "binance" => generate_evm_wallet().map(|(a, p, m)| (a, p, Some(m))),
         _ => Err("Unsupported chain".to_string()),
-    }
-}
+    };
 
-// ==================== DATA IMPORT ====================
-pub fn import_wallets_data(
-    user_id: i64,
-    wallets_data: Vec<serde_json::Value>,
-) -> Result<ImportDataResponse, String> {
-    let mut imported = 0;
-    let mut errors = Vec::new();
-    
-    for (idx, wallet_json) in wallets_data.iter().enumerate() {
-        let chain = wallet_json["chain"]
-            .as_str()
-            .ok_or_else(|| format!("Wallet {}: missing chain", idx))?;
-        
-        let private_key = wallet_json["private_key"]
-            .as_str()
-            .ok_or_else(|| format!("Wallet {}: missing private_key", idx))?;
-        
-        match validate_wallet_format(chain, private_key) {
-            Ok(_) => {
-                let result = match chain {
-                    "solana" => import_solana_wallet(private_key),
-                    "eth" | "ethereum" | "bsc" | "binance" => {
-                        import_evm_wallet(private_key).map(|(addr, pk)| (addr, pk))
-                    }
-                    _ => Err("Unsupported chain".to_string()),
-                };
-                
-                match result {
-                    Ok((address, _)) => {
-                        tracing::info!("Imported wallet {}: {} on {}", idx, address, chain);
-                        imported += 1;
-                    }
-                    Err(e) => {
-                        errors.push(format!("Wallet {}: {}", idx, e));
-                    }
-                }
-            }
-            Err(e) => {
-                errors.push(format!("Wallet {}: {}", idx, e));
+    match result {
+        Ok((address, private_key, mnemonic)) => {
+            // Save to DB
+            let encrypted_key = encrypt_key(&private_key, user_id);
+            
+            let insert_result = sqlx::query(
+                "INSERT INTO wallets (user_id, chain, address, private_key) VALUES ($1, $2, $3, $4)"
+            )
+            .bind(user_id)
+            .bind(&request.chain)
+            .bind(&address)
+            .bind(encrypted_key)
+            .execute(&state.db)
+            .await;
+            
+            match insert_result {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(WalletResponse {
+                        success: true,
+                        address: Some(address),
+                        private_key: Some(private_key),
+                        mnemonic,
+                        error: None,
+                    }),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(WalletResponse {
+                        success: false,
+                        address: None,
+                        private_key: None,
+                        mnemonic: None,
+                        error: Some(format!("Database error: {}", e)),
+                    }),
+                )
             }
         }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(WalletResponse {
+                success: false,
+                address: None,
+                private_key: None,
+                mnemonic: None,
+                error: Some(e),
+            }),
+        ),
     }
-    
-    Ok(ImportDataResponse {
-        success: errors.is_empty(),
-        imported_count: imported,
-        errors,
-    })
 }
 
-pub fn export_wallet_for_user(wallet: &WalletInfo) -> Result<serde_json::Value, String> {
-    let private_key = decrypt_key(&wallet.encrypted_private_key, wallet.user_id)?;
+pub async fn get_wallets_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    let wallets = sqlx::query_as::<_, WalletInfo>(
+        r#"
+        SELECT 
+            user_id, 
+            chain, 
+            address, 
+            private_key as encrypted_private_key, 
+            EXTRACT(EPOCH FROM created_at)::BIGINT as created_at,
+            NULL::text as balance, 
+            NULL::bigint as last_updated 
+        FROM wallets 
+        WHERE user_id = $1
+        "#
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await;
     
-    Ok(serde_json::json!({
-        "chain": wallet.chain,
-        "address": wallet.address,
-        "private_key": private_key,
-        "created_at": wallet.created_at,
-    }))
+    match wallets {
+        Ok(ws) => (StatusCode::OK, Json(ws)),
+        Err(e) => {
+            tracing::error!("Failed to fetch wallets: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+// ==================== KEY MANAGEMENT ====================
+pub async fn get_wallet_keypair(
+    user_id: i64,
+    chain: &str,
+    pool: &PgPool,
+) -> Result<solana_sdk::signature::Keypair, String> {
+    // 1. Fetch encrypted key from DB
+    #[derive(sqlx::FromRow)]
+    struct KeyRecord { private_key: String }
+    
+    let record = sqlx::query_as::<_, KeyRecord>(
+        "SELECT private_key FROM wallets WHERE user_id = $1 AND chain = $2"
+    )
+    .bind(user_id)
+    .bind(chain)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("DB Error: {}", e))?;
+
+    let record = record.ok_or("Wallet not found")?;
+
+    // 2. Decrypt key
+    let private_key_str = decrypt_key(&record.private_key, user_id)?;
+
+    // 3. Create Keypair (Solana only for now)
+    if chain == "solana" || chain == "sol" {
+        let bytes = bs58::decode(&private_key_str)
+            .into_vec()
+            .map_err(|_| "Invalid base58 key".to_string())?;
+        
+        solana_sdk::signature::Keypair::from_bytes(&bytes)
+            .map_err(|e| format!("Invalid keypair bytes: {}", e))
+    } else {
+        Err("Only Solana keypair retrieval supported currently".to_string())
+    }
+}
+
+// ... (Rest of format validation and helper functions remain same)
+// ... existing code ...
+
+pub async fn get_balance_handler(
+    State(state): State<AppState>,
+    Path((user_id, chain)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    // 1. Get wallet address from DB
+    #[derive(sqlx::FromRow)]
+    struct AddressRecord { address: String }
+
+    let record = sqlx::query_as::<_, AddressRecord>(
+        "SELECT address FROM wallets WHERE user_id = $1 AND chain = $2"
+    )
+    .bind(user_id) // Bind explicitly
+    .bind(&chain)   // Bind explicitly
+    .fetch_optional(&state.db)
+    .await;
+    
+    let address = match record {
+        Ok(Some(r)) => r.address,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Wallet not found"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+    
+    // 2. Fetch Balance based on chain
+    let result = match chain.as_str() {
+        "solana" | "sol" => crate::balance::get_solana_balance(&address, &state.solana_client).await,
+        "eth" | "ethereum" | "bsc" | "binance" => crate::balance::get_evm_balance(&address, &chain).await,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Unsupported chain"}))).into_response(),
+    };
+    
+    match result {
+        Ok(balance) => (StatusCode::OK, Json(balance)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+    }
 }

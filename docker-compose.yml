@@ -8,14 +8,19 @@ services:
       dockerfile: Dockerfile
     container_name: trading_engine
     environment:
-      - SOLANA_RPC=${SOLANA_RPC:-https://api.mainnet-beta.solana.com}
+      - SOLANA_RPC=${SOLANA_RPC:-https://api.devnet.solana.com}
+      - NETWORK=${NETWORK:-testnet}
       - PORT=3000
       - RUST_LOG=info
+      - DATABASE_URL=postgres://admin:tradingbot@postgres:5432/trading_bot
     ports:
       - "3000:3000"
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:3000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -33,6 +38,26 @@ services:
       - trading-engine
     restart: unless-stopped
 
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading_db
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=tradingbot
+      - POSTGRES_DB=trading_bot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U admin -d trading_bot" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pgdata:
-  redis-data:
+
+

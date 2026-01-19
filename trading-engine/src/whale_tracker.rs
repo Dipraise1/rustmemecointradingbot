@@ -79,6 +79,9 @@ pub struct WhaleActivity {
     pub volume_anomaly: f64, // Volume spike multiplier vs average
     pub velocity_score: f64, // Rapid trade indicator (0-1)
     pub market_impact: MarketImpact, // Overall market impact assessment
+    pub known_label: Option<String>,
+    pub is_first_entry: bool,
+    pub confidence_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,17 +118,13 @@ pub struct WhaleAlertResponse {
     pub error: Option<String>,
 }
 
-// ==================== WHALE DETECTION ====================
-pub fn is_whale_trade(size_usd: f64, chain: &str) -> bool {
-    // Dynamic thresholds based on market conditions
-    let base_threshold = match chain {
-        "solana" => 10_000.0,  // $10k+ on Solana
-        "eth" | "ethereum" => 50_000.0, // $50k+ on Ethereum
-        "bsc" | "binance" => 25_000.0,  // $25k+ on BSC
-        _ => 10_000.0,
+lazy_static::lazy_static! {
+    static ref KNOWN_WHALES: HashMap<String, String> = {
+        let mut m = HashMap::new();
+        m.insert("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1".to_string(), "Alameda (Tagged)".to_string());
+        m.insert("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(), "Binance Hot Wallet".to_string());
+        m
     };
-    
-    size_usd >= base_threshold
 }
 
 /// Enhanced whale detection with multiple criteria
@@ -158,12 +157,31 @@ pub fn detect_whale_activity(
         MarketImpact::Low
     };
     
+    // Smart Intelligence
+    let known_label = KNOWN_WHALES.get(&trade.wallet_address).cloned();
+    
+    // Check first entry: simplistic check if they have traded this token before in recent history
+    let previous_trades = recent_trades.iter()
+        .filter(|t| t.wallet_address == trade.wallet_address && t.token == trade.token && t.timestamp < trade.timestamp)
+        .count();
+    let is_first_entry = previous_trades == 0;
+    
+    // Calculate Confidence Score (0-100)
+    let mut confidence = 70.0; // Base confidence
+    if known_label.is_some() { confidence += 20.0; } // Known entity = high confidence it's accurate
+    if is_first_entry { confidence += 5.0; }
+    if trade.size_usd > 500_000.0 { confidence += 5.0; }
+    if confidence > 100.0 { confidence = 100.0; }
+    
     WhaleActivity {
         trade: trade.clone(),
         price_impact,
         volume_anomaly,
         velocity_score,
         market_impact,
+        known_label,
+        is_first_entry,
+        confidence_score: confidence,
     }
 }
 
