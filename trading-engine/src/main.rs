@@ -72,6 +72,10 @@ struct BuyRequest {
     slippage: f64,
     take_profit: f64,
     stop_loss: f64,
+    #[serde(default)]
+    is_simulation: bool,
+    #[serde(default)]
+    bundler_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -479,11 +483,51 @@ async fn execute_buy(
         }
     }
     
+    // 1.5 Handle Bundling
+    if request.bundler_enabled {
+        let mut bundle = bundler::create_bundle(request.user_id, request.chain.clone());
+        // For now, we create a new bundle every time. In reality, we'd fetch an active one.
+        // But since we persist bundles in memory/db, we can't easily fetch 'active' without DB changes.
+        // For this MVP, we just Bundle-and-Wait or add to a new one.
+        
+        let bundle_item = bundler::AddToBundleRequest {
+            user_id: request.user_id,
+            chain: request.chain.clone(),
+            tx_type: "BUY".to_string(),
+            token: request.token.clone(),
+            amount: request.amount.clone(),
+            slippage: request.slippage,
+            priority: Some(5),
+        };
+        
+        match bundler::add_transaction_to_bundle(&mut bundle, bundle_item) {
+             Ok(tx_id) => {
+                 return (
+                    StatusCode::OK,
+                    Json(BuyResponse {
+                        success: true,
+                        tx_hash: Some(format!("BUNDLED_{}", tx_id)),
+                        error: None,
+                        position_id: Some(format!("pending_bundle_{}", tx_id)),
+                    }),
+                );
+             },
+             Err(e) => {
+                 return (StatusCode::BAD_REQUEST, Json(BuyResponse { success: false, tx_hash: None, error: Some(e), position_id: None }));
+             }
+        }
+    }
+
     // 2. Execute trade
-    let tx_hash = match request.chain.as_str() {
-        "solana" => execute_solana_buy(&request, &state.solana_client, &state.db).await,
-        "eth" | "ethereum" | "bsc" | "binance" => execute_evm_buy(&request).await,
-        _ => Err("Unsupported chain".to_string()),
+    let tx_hash = if request.is_simulation {
+        tracing::info!("🧪 Simulating Buy for user {}", request.user_id);
+        Ok(format!("SIM_{}", Uuid::new_v4()))
+    } else {
+        match request.chain.as_str() {
+            "solana" => execute_solana_buy(&request, &state.solana_client, &state.db).await,
+            "eth" | "ethereum" | "bsc" | "binance" => execute_evm_buy(&request).await,
+            _ => Err("Unsupported chain".to_string()),
+        }
     };
     
     match tx_hash {
@@ -492,13 +536,15 @@ async fn execute_buy(
             
             // 3. Create transaction record in DB
             let tx_id = Uuid::new_v4().to_string();
+            let tx_type = if request.is_simulation { "SIM_BUY" } else { "BUY" };
+            
             let _ = sqlx::query(
                 "INSERT INTO transactions (transaction_id, user_id, chain, type, token_address, amount, price, tx_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
             )
             .bind(tx_id)
             .bind(request.user_id)
             .bind(&request.chain)
-            .bind("BUY")
+            .bind(tx_type)
             .bind(&request.token)
             .bind(&request.amount)
             .bind(entry_price)

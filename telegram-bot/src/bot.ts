@@ -33,6 +33,10 @@ interface TradingSettings {
   takeProfitPercent: number;
   stopLossPercent: number;
   autoTrade: boolean;
+  // New features
+  preset: 'custom' | 'safe' | 'degen' | 'snipe';
+  simulationMode: boolean;
+  bundlerMode: boolean;
 }
 
 interface Position {
@@ -71,6 +75,9 @@ bot.use(session({
       takeProfitPercent: 100,
       stopLossPercent: -40,
       autoTrade: false,
+      preset: 'custom',
+      simulationMode: false,
+      bundlerMode: false,
     },
   }),
 }));
@@ -499,6 +506,8 @@ bot.command('buy', async (ctx) => {
       slippage: settings.slippage,
       take_profit: settings.takeProfitPercent,
       stop_loss: settings.stopLossPercent,
+      is_simulation: settings.simulationMode,
+      bundler_enabled: settings.bundlerMode,
     });
 
     if (result.success) {
@@ -511,6 +520,7 @@ bot.command('buy', async (ctx) => {
         `TX: <code>${result.tx_hash}</code>\n\n` +
         `🎯 TP: +${settings.takeProfitPercent}%\n` +
         `🛑 SL: ${settings.stopLossPercent}%\n\n` +
+        `Type: ${settings.simulationMode ? '🧪 SIMULATION' : settings.bundlerMode ? '📦 BUNDLED' : '🚀 REAL'}\n` +
         `Position ID: <code>${result.position_id}</code>`,
         { parse_mode: 'HTML' }
       );
@@ -560,28 +570,126 @@ bot.command('positions', async (ctx) => {
 // /settings command
 bot.command('settings', async (ctx) => {
   const settings = ctx.session.settings;
+  const presetEmoji = {
+    custom: '⚙️',
+    safe: '🛡️',
+    degen: '🦍',
+    snipe: '⚡'
+  };
 
   const message = `
 ⚙️ <b>Your Settings</b>
 
-<b>Trading:</b>
-Chain: ${settings.defaultChain.toUpperCase()}
-Buy Amount: ${settings.buyAmount} ${settings.defaultChain === 'solana' ? 'SOL' : settings.defaultChain === 'eth' ? 'ETH' : 'BNB'}
-Slippage: ${settings.slippage}%
-Take Profit: +${settings.takeProfitPercent}%
-Stop Loss: ${settings.stopLossPercent}%
-Auto-Trade: ${settings.autoTrade ? 'ON ✅' : 'OFF ❌'}
+<b>Trading Mode:</b>
+• Simulation: ${settings.simulationMode ? '✅ ON' : '❌ OFF'}
+• Bundler: ${settings.bundlerMode ? '✅ ON' : '❌ OFF'} (Save Gas)
+• Preset: ${presetEmoji[settings.preset]} ${settings.preset.toUpperCase()}
 
-<b>Commands to change:</b>
-/chain <code>&lt;sol|eth|bsc&gt;</code>
-/amount <code>&lt;number&gt;</code>
-/slippage <code>&lt;%&gt;</code>
-/tp <code>&lt;%&gt;</code>
-/sl <code>&lt;-%&gt;</code>
+<b>Parameters:</b>
+• Chain: ${settings.defaultChain.toUpperCase()}
+• Buy Amount: ${settings.buyAmount} ${settings.defaultChain === 'solana' ? 'SOL' : settings.defaultChain === 'eth' ? 'ETH' : 'BNB'}
+• Slippage: ${settings.slippage}%
+• Take Profit: +${settings.takeProfitPercent}%
+• Stop Loss: ${settings.stopLossPercent}%
+• Auto-Trade: ${settings.autoTrade ? 'ON ✅' : 'OFF ❌'}
   `;
 
-  await ctx.reply(message, { parse_mode: 'HTML' });
+  const keyboard = new InlineKeyboard()
+    .text(`🧪 Sim Mode: ${settings.simulationMode ? 'ON' : 'OFF'}`, 'toggle_sim')
+    .text(`📦 Bundler: ${settings.bundlerMode ? 'ON' : 'OFF'}`, 'toggle_bundler').row()
+    .text('🛡️ Safe', 'preset_safe')
+    .text('🦍 Degen', 'preset_degen')
+    .text('⚡ Snipe', 'preset_snipe').row()
+    .text('🔙 Back', 'back_main');
+
+  await ctx.reply(message, { parse_mode: 'HTML', reply_markup: keyboard });
 });
+
+// Toggle Handlers
+bot.callbackQuery('toggle_sim', async (ctx) => {
+  ctx.session.settings.simulationMode = !ctx.session.settings.simulationMode;
+  await ctx.answerCallbackQuery(`Simulation Mode: ${ctx.session.settings.simulationMode ? 'ON' : 'OFF'}`);
+  await showSettings(ctx); // Helper to refresh settings view
+});
+
+bot.callbackQuery('toggle_bundler', async (ctx) => {
+  ctx.session.settings.bundlerMode = !ctx.session.settings.bundlerMode;
+  await ctx.answerCallbackQuery(`Bundler Mode: ${ctx.session.settings.bundlerMode ? 'ON' : 'OFF'}`);
+  await showSettings(ctx);
+});
+
+// Preset Handlers
+bot.callbackQuery('preset_safe', async (ctx) => {
+  const s = ctx.session.settings;
+  s.preset = 'safe';
+  s.slippage = 1;
+  s.takeProfitPercent = 20;
+  s.stopLossPercent = -10;
+  await ctx.answerCallbackQuery('Applied Safe Preset');
+  await showSettings(ctx);
+});
+
+bot.callbackQuery('preset_degen', async (ctx) => {
+  const s = ctx.session.settings;
+  s.preset = 'degen';
+  s.slippage = 10;
+  s.takeProfitPercent = 100;
+  s.stopLossPercent = -50;
+  await ctx.answerCallbackQuery('Applied Degen Preset');
+  await showSettings(ctx);
+});
+
+bot.callbackQuery('preset_snipe', async (ctx) => {
+  const s = ctx.session.settings;
+  s.preset = 'snipe';
+  s.slippage = 20;
+  s.takeProfitPercent = 200;
+  s.stopLossPercent = -80;
+  await ctx.answerCallbackQuery('Applied Snipe Preset');
+  await showSettings(ctx);
+});
+
+// Helper to refresh settings message
+async function showSettings(ctx: MyContext) {
+  const settings = ctx.session.settings;
+  const presetEmoji = {
+    custom: '⚙️',
+    safe: '🛡️',
+    degen: '🦍',
+    snipe: '⚡'
+  };
+
+  const message = `
+⚙️ <b>Your Settings</b>
+
+<b>Trading Mode:</b>
+• Simulation: ${settings.simulationMode ? '✅ ON' : '❌ OFF'}
+• Bundler: ${settings.bundlerMode ? '✅ ON' : '❌ OFF'} (Save Gas)
+• Preset: ${presetEmoji[settings.preset]} ${settings.preset.toUpperCase()}
+
+<b>Parameters:</b>
+• Chain: ${settings.defaultChain.toUpperCase()}
+• Buy Amount: ${settings.buyAmount} ${settings.defaultChain === 'solana' ? 'SOL' : settings.defaultChain === 'eth' ? 'ETH' : 'BNB'}
+• Slippage: ${settings.slippage}%
+• Take Profit: +${settings.takeProfitPercent}%
+• Stop Loss: ${settings.stopLossPercent}%
+• Auto-Trade: ${settings.autoTrade ? 'ON ✅' : 'OFF ❌'}
+  `;
+
+  const keyboard = new InlineKeyboard()
+    .text(`🧪 Sim Mode: ${settings.simulationMode ? 'ON' : 'OFF'}`, 'toggle_sim')
+    .text(`📦 Bundler: ${settings.bundlerMode ? 'ON' : 'OFF'}`, 'toggle_bundler').row()
+    .text('🛡️ Safe', 'preset_safe')
+    .text('🦍 Degen', 'preset_degen')
+    .text('⚡ Snipe', 'preset_snipe').row()
+    .text('🔙 Back', 'back_main');
+
+  try {
+    await ctx.editMessageText(message, { parse_mode: 'HTML', reply_markup: keyboard });
+  } catch (e) {
+    // Ignore unedited error
+  }
+}
 
 // /chain command
 bot.command('chain', async (ctx) => {
