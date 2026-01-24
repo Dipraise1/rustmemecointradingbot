@@ -191,32 +191,62 @@ async fn main() {
     
     // ==================== RPC HEALTH CHECK ====================
     tracing::info!("Checking Solana RPC connection...");
-    let solana_client = RpcClient::new(solana_rpc.clone());
     
-    match solana_client.get_health() {
-        Ok(_) => {
-            tracing::info!("✅ Solana RPC healthy: {}", solana_rpc);
-        },
-        Err(e) => {
-            tracing::warn!("⚠️  Solana RPC health check failed: {}", e);
-            tracing::warn!("   Continuing anyway - RPC may still work for transactions");
+    // Create RPC client with commitment config for better reliability
+    use solana_sdk::commitment_config::CommitmentConfig;
+    let commitment_config = CommitmentConfig::confirmed();
+    let solana_client = RpcClient::new_with_commitment(solana_rpc.clone(), commitment_config);
+    
+    // Try health check with retry logic
+    let mut health_ok = false;
+    for attempt in 1..=3 {
+        match solana_client.get_health() {
+            Ok(_) => {
+                tracing::info!("✅ Solana RPC healthy: {}", solana_rpc);
+                health_ok = true;
+                break;
+            },
+            Err(e) => {
+                tracing::warn!("⚠️  Solana RPC health check attempt {}/3 failed: {}", attempt, e);
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
         }
     }
     
-    // Get version to verify connection
-    match solana_client.get_version() {
-        Ok(version) => {
-            tracing::info!("   Solana version: {}", version.solana_core);
-        },
-        Err(e) => {
-            tracing::error!("❌ Failed to connect to Solana RPC: {}", e);
-            tracing::error!("   Check SOLANA_RPC environment variable");
-            panic!("Cannot start without Solana RPC connection");
+    if !health_ok {
+        tracing::warn!("   Health check failed after 3 attempts - continuing anyway");
+        tracing::warn!("   RPC may still work for transactions");
+    }
+    
+    // Get version to verify connection (with retry)
+    let mut version_ok = false;
+    for attempt in 1..=3 {
+        match solana_client.get_version() {
+            Ok(version) => {
+                tracing::info!("   Solana version: {}", version.solana_core);
+                version_ok = true;
+                break;
+            },
+            Err(e) => {
+                tracing::warn!("   Version check attempt {}/3 failed: {}", attempt, e);
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
         }
     }
     
-    // Initialize Solana Client
-    let solana_client = Arc::new(RpcClient::new(solana_rpc));
+    if !version_ok {
+        tracing::error!("❌ Failed to connect to Solana RPC after 3 attempts");
+        tracing::error!("   Check SOLANA_RPC environment variable: {}", solana_rpc);
+        tracing::error!("   Try using a different RPC endpoint (e.g., Helius, QuickNode)");
+        panic!("Cannot start without Solana RPC connection");
+    }
+    
+    // Initialize Solana Client with commitment config
+    let solana_client = Arc::new(RpcClient::new_with_commitment(solana_rpc, commitment_config));
     
     let state = AppState {
         db: pool,
@@ -306,31 +336,45 @@ async fn execute_solana_buy(
         );
         
         // REALISTIC DEVNET SIMULATION:
-        // Actually deduct SOL from wallet to mirror mainnet behavior
-        // This makes testing realistic and easy to switch to mainnet
+        // Transfer SOL to a derived address (vault) that we can later retrieve from
+        // Using create_account_with_seed so we can transfer back using transfer_with_seed
         
         let amount_lamports = (request.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0) as u64;
         
-        // Transfer SOL to a burn address (simulating buying tokens)
-        // In production, this would be a DEX swap
-        // Using a deterministic "token vault" address for this user+token combo
-        let vault_seed = format!("vault_{}_{}", request.user_id, &request.token[..8]);
+        // Create deterministic vault address using create_with_seed
+        let vault_seed = format!("v{}{}", request.user_id, &request.token[..6]);
         let vault_pubkey = Pubkey::create_with_seed(
             &keypair.pubkey(),
             &vault_seed,
             &solana_sdk::system_program::id()
         ).map_err(|e| format!("Failed to create vault address: {}", e))?;
         
+        // Transfer SOL to vault (this deducts from user's balance)
         let ix = solana_sdk::system_instruction::transfer(
             &keypair.pubkey(), 
             &vault_pubkey,
-            amount_lamports  // Actually deduct the SOL
+            amount_lamports
         );
         
-        // 3. Get Blockhash
-        let recent_blockhash = client
-            .get_latest_blockhash()
-            .map_err(|e| format!("Failed to get blockhash: {}", e))?;
+        // 3. Get Blockhash (with retry logic)
+        let mut recent_blockhash = None;
+        for attempt in 1..=3 {
+            match client.get_latest_blockhash() {
+                Ok(hash) => {
+                    recent_blockhash = Some(hash);
+                    break;
+                },
+                Err(e) => {
+                    tracing::warn!("   Blockhash fetch attempt {}/3 failed: {}", attempt, e);
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        
+        let recent_blockhash = recent_blockhash
+            .ok_or_else(|| "Failed to get blockhash after 3 attempts".to_string())?;
             
         let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
             &[ix],
@@ -344,7 +388,8 @@ async fn execute_solana_buy(
             .send_and_confirm_transaction(&tx)
             .map_err(|e| format!("Transaction failed: {}", e))?;
         
-        tracing::info!("   ✅ Simulated buy complete. SOL remains in wallet for testing.");
+        tracing::info!("   ✅ Transferred {} SOL to vault: {}", request.amount, vault_pubkey);
+        tracing::info!("   (Simulating token purchase - SOL locked in vault)");
             
         Ok(signature.to_string())
     } else {
@@ -397,9 +442,8 @@ async fn execute_solana_sell(
          tracing::info!("   Selling {} SOL worth → Returning {} SOL", original_sol, sol_to_return);
          tracing::info!("   P/L: {} SOL ({:+.2}%)", profit_loss, profit_loss_percent);
          
-         // Transfer SOL back from vault to user
-         // Using the same deterministic vault address
-         let vault_seed = format!("vault_{}_{}", position.user_id, &position.token_address[..8]);
+         // Get the vault address (same seed as buy)
+         let vault_seed = format!("v{}{}", position.user_id, &position.token_address[..6]);
          let vault_pubkey = Pubkey::create_with_seed(
              &keypair.pubkey(),
              &vault_seed,
@@ -408,27 +452,36 @@ async fn execute_solana_sell(
          
          let sol_to_return_lamports = (sol_to_return * 1_000_000_000.0) as u64;
          
-         // Since we don't have the vault's private key, we'll simulate by doing a self-transfer
-         // of the profit/loss amount. In production, this would be a DEX swap.
-         let ix = if profit_loss >= 0.0 {
-             // Profit: Add SOL to wallet (simulated by self-transfer of profit amount)
-             solana_sdk::system_instruction::transfer(
-                &keypair.pubkey(), 
-                &keypair.pubkey(), 
-                (profit_loss.abs() * 1_000_000_000.0) as u64
-            )
-         } else {
-             // Loss: This was already deducted during buy, just mark the transaction
-             solana_sdk::system_instruction::transfer(
-                &keypair.pubkey(), 
-                &keypair.pubkey(), 
-                1000  // Tiny amount to create signature
-            )
-         };
+         // Use transfer_with_seed to transfer FROM the vault back to the user
+         // This works because the vault was created with create_with_seed using user's pubkey as base
+         let ix = solana_sdk::system_instruction::transfer_with_seed(
+            &vault_pubkey,           // From: vault
+            &keypair.pubkey(),       // Base: user (who created the vault)
+            vault_seed.clone(),      // Seed used to create vault
+            &solana_sdk::system_program::id(), // Owner
+            &keypair.pubkey(),       // To: user
+            sol_to_return_lamports,  // Amount to return (original + profit/loss)
+        );
         
-        let recent_blockhash = client
-            .get_latest_blockhash()
-            .map_err(|e| format!("Failed to get blockhash: {}", e))?;
+        // Get Blockhash (with retry logic)
+        let mut recent_blockhash = None;
+        for attempt in 1..=3 {
+            match client.get_latest_blockhash() {
+                Ok(hash) => {
+                    recent_blockhash = Some(hash);
+                    break;
+                },
+                Err(e) => {
+                    tracing::warn!("   Blockhash fetch attempt {}/3 failed: {}", attempt, e);
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        
+        let recent_blockhash = recent_blockhash
+            .ok_or_else(|| "Failed to get blockhash after 3 attempts".to_string())?;
             
         let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
             &[ix],
