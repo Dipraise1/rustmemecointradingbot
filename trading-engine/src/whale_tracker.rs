@@ -4,6 +4,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use chrono::Utc;
+use axum::{
+    extract::{State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use crate::AppState;
 
 // ==================== DATA STRUCTURES ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,7 +361,7 @@ pub fn calculate_whale_stats(
     let total_volume: f64 = recent_trades.iter().map(|t| t.size_usd).sum();
     
     let largest_trade = recent_trades.iter()
-        .max_by(|a, b| a.size_usd.partial_cmp(&b.size_usd).unwrap());
+        .max_by(|a, b| a.size_usd.partial_cmp(&b.size_usd).unwrap_or(std::cmp::Ordering::Equal));
     
     // Calculate long/short ratio
     let long_volume: f64 = recent_trades.iter()
@@ -381,7 +388,7 @@ pub fn calculate_whale_stats(
         .cloned()
         .collect();
     
-    top_whales.sort_by(|a, b| b.total_volume_24h.partial_cmp(&a.total_volume_24h).unwrap());
+    top_whales.sort_by(|a, b| b.total_volume_24h.partial_cmp(&a.total_volume_24h).unwrap_or(std::cmp::Ordering::Equal));
     top_whales.truncate(10); // Top 10
     
     WhaleTrackerStats {
@@ -422,29 +429,65 @@ pub fn create_whale_alert(request: CreateWhaleAlertRequest) -> WhaleAlert {
     }
 }
 
+// In memory storage for alerts (should be DB in production)
+use std::sync::RwLock;
+// lazy_static! defined earlier
+
+use axum::extract::Path; // Add Path import
+
+// ...
+
+pub async fn get_user_alerts_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    let alerts_map = state.whale_alerts.read().await;
+    
+    // In a real DB, we'd query by user_id. Here we scan the map.
+    // However, the map key is alert_id, not user_id.
+    // The current state is `HashMap<String, WhaleAlert>`.
+    
+    let user_alerts: Vec<WhaleAlert> = alerts_map.values()
+        .filter(|a| a.user_id == user_id)
+        .cloned()
+        .collect();
+        
+    (StatusCode::OK, Json(user_alerts))
+}
+
+
 pub fn check_whale_alert(
     trade: &WhaleTrade,
     alert: &WhaleAlert,
 ) -> bool {
-    if !alert.active {
-        return false;
-    }
-    
-    if trade.size_usd < alert.min_size_usd {
-        return false;
-    }
-    
-    if !alert.chains.is_empty() && !alert.chains.contains(&trade.chain) {
-        return false;
-    }
-    
-    if !alert.tokens.is_empty() && !alert.tokens.contains(&trade.token) {
-        return false;
-    }
-    
-    if !alert.position_types.contains(&trade.position_type) {
-        return false;
-    }
-    
+    if !alert.active { return false; }
+    if trade.size_usd < alert.min_size_usd { return false; }
+    if !alert.chains.is_empty() && !alert.chains.contains(&trade.chain) { return false; }
+    if !alert.tokens.is_empty() && !alert.tokens.contains(&trade.token) { return false; }
+    if !alert.position_types.contains(&trade.position_type) { return false; }
     true
 }
+
+// ==================== API HANDLERS ====================
+
+pub async fn get_whale_stats_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let whale_trades = state.whale_trades.read().await;
+    
+    // In a real app, we'd persist whales to DB, but for now we rebuild stats from in-memory trades
+    // or we would have a persisted whale_map. 
+    // Let's build a temporary whale_map from the trades we have.
+    let mut whale_map = HashMap::new();
+    
+    for trade in whale_trades.iter() {
+        // Calculate basic impact for stats
+        let impact = calculate_price_impact(trade.size_usd, &trade.chain);
+        track_whale_trade(trade.clone(), &mut whale_map, impact);
+    }
+    
+    let stats = calculate_whale_stats(&whale_trades, &whale_map);
+    
+    (StatusCode::OK, Json(stats))
+}
+

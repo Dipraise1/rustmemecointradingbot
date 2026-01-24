@@ -4,6 +4,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use chrono::Utc;
+use axum::{
+    extract::{Path, State, Query},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use crate::AppState;
 
 // ==================== DATA STRUCTURES ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,16 +174,16 @@ pub fn build_leaderboard(
     // Sort by metric
     match metric {
         "pnl" => {
-            entries.sort_by(|a, b| b.total_pnl_usd.partial_cmp(&a.total_pnl_usd).unwrap());
+            entries.sort_by(|a, b| b.total_pnl_usd.partial_cmp(&a.total_pnl_usd).unwrap_or(std::cmp::Ordering::Equal));
         }
         "volume" => {
-            entries.sort_by(|a, b| b.total_volume_usd.partial_cmp(&a.total_volume_usd).unwrap());
+            entries.sort_by(|a, b| b.total_volume_usd.partial_cmp(&a.total_volume_usd).unwrap_or(std::cmp::Ordering::Equal));
         }
         "winrate" => {
-            entries.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap());
+            entries.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap_or(std::cmp::Ordering::Equal));
         }
         _ => {
-            entries.sort_by(|a, b| b.total_pnl_usd.partial_cmp(&a.total_pnl_usd).unwrap());
+            entries.sort_by(|a, b| b.total_pnl_usd.partial_cmp(&a.total_pnl_usd).unwrap_or(std::cmp::Ordering::Equal));
         }
     }
     
@@ -196,7 +203,7 @@ pub fn build_leaderboard(
 }
 
 // ==================== TRADE RECORD ====================
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TradeRecord {
     pub user_id: i64,
     pub trade_id: String,
@@ -254,3 +261,58 @@ pub fn get_user_position(
     leaderboard.entries.iter()
         .find(|e| e.user_id == user_id)
 }
+
+// ==================== API HANDLERS ====================
+
+pub async fn get_daily_leaderboard_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    // 1. Fetch all trades from DB
+    let trades = sqlx::query_as::<_, TradeRecord>("SELECT * FROM transactions")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or(vec![]);
+
+    // 2. Build Daily Leaderboard
+    let leaderboard = build_leaderboard(
+        &trades,
+        LeaderboardPeriod::Daily,
+        "pnl",
+        100 // Top 100
+    );
+
+    // 3. Get User's Rank
+    let user_rank = get_user_rank(user_id, &leaderboard);
+    let user_entry = get_user_position(user_id, &leaderboard).cloned();
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "period": "Daily",
+        "rank": user_rank,
+        "entry": user_entry,
+        "top_10": leaderboard.entries.iter().take(10).collect::<Vec<_>>(),
+    })))
+}
+
+pub async fn get_alltime_leaderboard_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let trades = sqlx::query_as::<_, TradeRecord>("SELECT * FROM transactions")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or(vec![]);
+
+    let leaderboard = build_leaderboard(
+        &trades,
+        LeaderboardPeriod::AllTime,
+        "pnl",
+        100
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "period": "AllTime",
+        "top_10": leaderboard.entries.iter().take(10).collect::<Vec<_>>(),
+    })))
+}
+
+

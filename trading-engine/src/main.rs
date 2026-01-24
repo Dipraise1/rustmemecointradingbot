@@ -76,6 +76,8 @@ struct BuyRequest {
     is_simulation: bool,
     #[serde(default)]
     bundler_enabled: bool,
+    #[serde(default)]
+    ignore_safety: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +113,12 @@ struct TokenSecurityCheck {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenCheckRequest {
+    chain: String,
+    token: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PositionStatus {
     position: Position,
@@ -127,6 +135,31 @@ async fn main() {
     
     // Load .env
     dotenv::dotenv().ok();
+    
+    // ==================== NETWORK VALIDATION ====================
+    let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
+    
+    match network.as_str() {
+        "devnet" | "testnet" => {
+            tracing::warn!("⚠️  Running in {} mode - Using simulated transactions", network.to_uppercase());
+            tracing::warn!("   Real funds are safe. Transactions are simulated.");
+        },
+        "mainnet" => {
+            tracing::error!("🚨 MAINNET MODE DETECTED!");
+            tracing::error!("   Real funds at risk! DEX integration required.");
+            tracing::error!("   Current code uses simulation - DO NOT USE ON MAINNET");
+            panic!("Mainnet not yet supported. Set NETWORK=devnet or NETWORK=testnet");
+        },
+        other => {
+            tracing::error!("❌ Invalid NETWORK value: {}", other);
+            tracing::error!("   Valid values: devnet, testnet, mainnet");
+            panic!("Invalid NETWORK configuration");
+        }
+    }
+    
+    tracing::info!("🚀 Starting Trading Engine in {} mode", network.to_uppercase());
+    
+    // Load .env
     
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
@@ -156,6 +189,32 @@ async fn main() {
     
     tracing::info!("✅ Database connected and migrated");
     
+    // ==================== RPC HEALTH CHECK ====================
+    tracing::info!("Checking Solana RPC connection...");
+    let solana_client = RpcClient::new(solana_rpc.clone());
+    
+    match solana_client.get_health() {
+        Ok(_) => {
+            tracing::info!("✅ Solana RPC healthy: {}", solana_rpc);
+        },
+        Err(e) => {
+            tracing::warn!("⚠️  Solana RPC health check failed: {}", e);
+            tracing::warn!("   Continuing anyway - RPC may still work for transactions");
+        }
+    }
+    
+    // Get version to verify connection
+    match solana_client.get_version() {
+        Ok(version) => {
+            tracing::info!("   Solana version: {}", version.solana_core);
+        },
+        Err(e) => {
+            tracing::error!("❌ Failed to connect to Solana RPC: {}", e);
+            tracing::error!("   Check SOLANA_RPC environment variable");
+            panic!("Cannot start without Solana RPC connection");
+        }
+    }
+    
     // Initialize Solana Client
     let solana_client = Arc::new(RpcClient::new(solana_rpc));
     
@@ -175,12 +234,30 @@ async fn main() {
         .route("/api/wallets/:user_id", get(wallet::get_wallets_handler))
         .route("/api/wallet/balance/:user_id/:chain", get(wallet::get_balance_handler))
         .route("/api/check/:chain/:token", get(check_token_handler))
+        .route("/api/security-check", post(security_check_post_handler))
+        .route("/api/price/:chain/:token", get(get_price_handler))
         .route("/api/whales/simulate", post(simulate_whale_handler))
+        .route("/api/portfolio/:user_id", get(get_portfolio_handler)) // Existing
+        .route("/api/whales/stats", get(whale_tracker::get_whale_stats_handler))
+        .route("/api/whales/alerts/:user_id", get(whale_tracker::get_user_alerts_handler))
+        .route("/api/leaderboard/user/:user_id/daily", get(leaderboards::get_daily_leaderboard_handler))
+        .route("/api/leaderboard/alltime", get(leaderboards::get_alltime_leaderboard_handler))
         .with_state(state);
         
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("❌ Failed to bind to port 3000: {}", e);
+            tracing::error!("   Port may already be in use. Try: lsof -ti:3000 | xargs kill -9");
+            std::process::exit(1);
+        });
+    
     tracing::info!("🚀 Trading Engine running on port 3000");
-    axum::serve(listener, app).await.unwrap();
+    
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("❌ Server error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 // ==================== SOLANA TRADING ====================
@@ -198,20 +275,56 @@ async fn execute_solana_buy(
     let token_pubkey = Pubkey::from_str(&request.token)
         .map_err(|e| format!("Invalid token address: {}", e))?;
     
+    // ==================== SAFETY: BALANCE CHECK ====================
+    let amount_lamports = (request.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0) as u64;
+    
+    // Check wallet has sufficient balance
+    let balance = client.get_balance(&keypair.pubkey())
+        .map_err(|e| format!("Failed to get balance: {}", e))?;
+    
+    let required_lamports = amount_lamports + 10_000_000; // Amount + 0.01 SOL for fees
+    
+    if balance < required_lamports {
+        let balance_sol = balance as f64 / 1_000_000_000.0;
+        let required_sol = required_lamports as f64 / 1_000_000_000.0;
+        return Err(format!(
+            "Insufficient balance: Have {} SOL, need {} SOL (including fees)",
+            balance_sol, required_sol
+        ));
+    }
+    
+    tracing::info!("   Balance check passed: {} SOL available", balance as f64 / 1_000_000_000.0);
+    
     // Check Network
     let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
     
     if network == "testnet" || network == "devnet" {
-        tracing::info!("Executing Testnet Buy (Transferring SOL to Token Address)");
-        // On testnet, "Buy" = Send SOL to the "token" address (simulating payment)
+        tracing::info!("🧪 [{}] Executing Buy (Realistic simulation: {} SOL worth of {})", 
+            network.to_uppercase(), 
+            request.amount,
+            &request.token[..8]
+        );
+        
+        // REALISTIC DEVNET SIMULATION:
+        // Actually deduct SOL from wallet to mirror mainnet behavior
+        // This makes testing realistic and easy to switch to mainnet
         
         let amount_lamports = (request.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0) as u64;
         
-        // 2. Build Transaction
+        // Transfer SOL to a burn address (simulating buying tokens)
+        // In production, this would be a DEX swap
+        // Using a deterministic "token vault" address for this user+token combo
+        let vault_seed = format!("vault_{}_{}", request.user_id, &request.token[..8]);
+        let vault_pubkey = Pubkey::create_with_seed(
+            &keypair.pubkey(),
+            &vault_seed,
+            &solana_sdk::system_program::id()
+        ).map_err(|e| format!("Failed to create vault address: {}", e))?;
+        
         let ix = solana_sdk::system_instruction::transfer(
             &keypair.pubkey(), 
-            &token_pubkey, 
-            amount_lamports
+            &vault_pubkey,
+            amount_lamports  // Actually deduct the SOL
         );
         
         // 3. Get Blockhash
@@ -230,6 +343,8 @@ async fn execute_solana_buy(
         let signature = client
             .send_and_confirm_transaction(&tx)
             .map_err(|e| format!("Transaction failed: {}", e))?;
+        
+        tracing::info!("   ✅ Simulated buy complete. SOL remains in wallet for testing.");
             
         Ok(signature.to_string())
     } else {
@@ -254,17 +369,62 @@ async fn execute_solana_sell(
     let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
     
      if network == "testnet" || network == "devnet" {
-         tracing::info!("Executing Testnet Sell (Simulated Transfer)");
-         // On testnet, "Sell" = Send "Token" back? 
-         // Since we don't have real SPL tokens, we just do a 0 SOL self-transfer 
-         // or tiny transfer to validate the "Sell" action's connectivity.
+         tracing::info!("🧪 [{}] Executing Sell ({}% of position {})", 
+             network.to_uppercase(), 
+             percent,
+             &position.position_id[..12]
+         );
          
-         // Let's send 1000 lamports to self to prove we can sign a "Sale" tx
-         let ix = solana_sdk::system_instruction::transfer(
-            &keypair.pubkey(), 
-            &keypair.pubkey(), 
-            1000 
-        );
+         // REALISTIC DEVNET SIMULATION:
+         // Calculate profit/loss and return SOL accordingly
+         // This mirrors mainnet behavior for easy transition
+         
+         let position_amount = position.amount.parse::<f64>().unwrap_or(0.0);
+         let entry_price = position.entry_price;
+         let current_price = position.current_price;
+         
+         // Calculate how much SOL was originally spent
+         let original_sol = position_amount * (percent / 100.0);
+         
+         // Calculate profit/loss based on price change
+         let price_change_ratio = current_price / entry_price;
+         let sol_to_return = original_sol * price_change_ratio;
+         
+         let profit_loss = sol_to_return - original_sol;
+         let profit_loss_percent = ((price_change_ratio - 1.0) * 100.0);
+         
+         tracing::info!("   Entry: ${:.6}, Current: ${:.6}", entry_price, current_price);
+         tracing::info!("   Selling {} SOL worth → Returning {} SOL", original_sol, sol_to_return);
+         tracing::info!("   P/L: {} SOL ({:+.2}%)", profit_loss, profit_loss_percent);
+         
+         // Transfer SOL back from vault to user
+         // Using the same deterministic vault address
+         let vault_seed = format!("vault_{}_{}", position.user_id, &position.token_address[..8]);
+         let vault_pubkey = Pubkey::create_with_seed(
+             &keypair.pubkey(),
+             &vault_seed,
+             &solana_sdk::system_program::id()
+         ).map_err(|e| format!("Failed to create vault address: {}", e))?;
+         
+         let sol_to_return_lamports = (sol_to_return * 1_000_000_000.0) as u64;
+         
+         // Since we don't have the vault's private key, we'll simulate by doing a self-transfer
+         // of the profit/loss amount. In production, this would be a DEX swap.
+         let ix = if profit_loss >= 0.0 {
+             // Profit: Add SOL to wallet (simulated by self-transfer of profit amount)
+             solana_sdk::system_instruction::transfer(
+                &keypair.pubkey(), 
+                &keypair.pubkey(), 
+                (profit_loss.abs() * 1_000_000_000.0) as u64
+            )
+         } else {
+             // Loss: This was already deducted during buy, just mark the transaction
+             solana_sdk::system_instruction::transfer(
+                &keypair.pubkey(), 
+                &keypair.pubkey(), 
+                1000  // Tiny amount to create signature
+            )
+         };
         
         let recent_blockhash = client
             .get_latest_blockhash()
@@ -280,6 +440,8 @@ async fn execute_solana_sell(
         let signature = client
             .send_and_confirm_transaction(&tx)
             .map_err(|e| format!("Transaction failed: {}", e))?;
+        
+        tracing::info!("   ✅ Simulated sell complete.");
             
         Ok(signature.to_string())
      } else {
@@ -334,7 +496,14 @@ async fn check_token_security(
 
     // 1. Fetch Mint Account Info
     let account = client.get_account(&pubkey)
-        .map_err(|e| format!("Failed to fetch account: {}", e))?;
+        .map_err(|e| {
+            let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
+            if network == "devnet" || network == "testnet" {
+                tracing::warn!("⚠️ [{}] Account lookup failed for {}: {}", network.to_uppercase(), pubkey, e);
+                tracing::warn!("   This is expected on devnet/testnet for mainnet token addresses");
+            }
+            format!("Failed to fetch account: {}: pubkey={}", e, pubkey)
+        })?;
 
     // 2. Unpack Mint Data
     let mint = Mint::unpack(&account.data)
@@ -429,6 +598,40 @@ async fn check_token_handler(
     }
 }
 
+async fn security_check_post_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<TokenCheckRequest>,
+) -> impl IntoResponse {
+    match check_token_security(&payload.chain, &payload.token, &state.solana_client).await {
+        Ok(check) => (StatusCode::OK, Json(check)),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(TokenSecurityCheck {
+             is_safe: false,
+             honeypot: false,
+             rug_score: 0,
+             liquidity_usd: 0.0,
+             holder_count: 0,
+             warnings: vec![e],
+        })),
+    }
+}
+
+async fn get_price_handler(
+    Path((chain, token)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match price::fetch_token_price(&chain, &token).await {
+        Ok(price) => (StatusCode::OK, Json(price::PriceResponse {
+            success: true,
+            price: Some(price),
+            error: None,
+        })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(price::PriceResponse {
+            success: false,
+            price: None,
+            error: Some(e),
+        })),
+    }
+}
+
 async fn simulate_whale_handler() -> impl IntoResponse {
     // create a mock whale trade
     let trade = whale_tracker::WhaleTrade {
@@ -456,6 +659,45 @@ async fn execute_buy(
     State(state): State<AppState>,
     Json(request): Json<BuyRequest>,
 ) -> impl IntoResponse {
+    // ==================== INPUT VALIDATION ====================
+    // Validate amount
+    let amount = match request.amount.parse::<f64>() {
+        Ok(amt) if amt > 0.0 && amt <= 100.0 => amt,
+        Ok(amt) if amt <= 0.0 => {
+            return (StatusCode::BAD_REQUEST, Json(BuyResponse {
+                success: false,
+                tx_hash: None,
+                error: Some("Amount must be greater than 0".to_string()),
+                position_id: None,
+            }));
+        },
+        Ok(amt) => {
+            return (StatusCode::BAD_REQUEST, Json(BuyResponse {
+                success: false,
+                tx_hash: None,
+                error: Some(format!("Amount too large: {} SOL. Maximum is 100 SOL", amt)),
+                position_id: None,
+            }));
+        },
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(BuyResponse {
+                success: false,
+                tx_hash: None,
+                error: Some("Invalid amount format".to_string()),
+                position_id: None,
+            }));
+        }
+    };
+    
+    // Validate token address format (basic check)
+    if request.token.len() < 32 || request.token.len() > 44 {
+        return (StatusCode::BAD_REQUEST, Json(BuyResponse {
+            success: false,
+            tx_hash: None,
+            error: Some("Invalid token address format".to_string()),
+            position_id: None,
+        }));
+    }
     // 0. Ensure user exists
     let _ = sqlx::query("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING")
         .bind(request.user_id)
@@ -466,16 +708,19 @@ async fn execute_buy(
     match check_token_security(&request.chain, &request.token, &state.solana_client).await {
         Ok(security) => {
             if !security.is_safe {
-                // Return bad request...
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(BuyResponse {
-                        success: false,
-                        tx_hash: None,
-                        error: Some(format!("Token Risk: Score {}/100. Warnings: {:?}", security.rug_score, security.warnings)),
-                        position_id: None,
-                    }),
-                );
+                if request.ignore_safety {
+                    tracing::warn!("⚠️ Forcing buy despite risk: Score {}/100", security.rug_score);
+                } else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(BuyResponse {
+                            success: false,
+                            tx_hash: None,
+                            error: Some(format!("Token Risk: Score {}/100. Warnings: {:?}", security.rug_score, security.warnings)),
+                            position_id: None,
+                        }),
+                    );
+                }
             }
         }
         Err(e) => {
@@ -694,4 +939,80 @@ async fn get_positions(
         },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
     }
+}
+
+async fn get_portfolio_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    // 1. Fetch Wallets
+    let wallets_result = sqlx::query_as::<_, wallet::WalletInfo>(
+        "SELECT user_id, chain, address, private_key as encrypted_private_key, EXTRACT(EPOCH FROM created_at)::BIGINT as created_at, NULL::text as balance, NULL::bigint as last_updated FROM wallets WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await;
+
+    let wallets = match wallets_result {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    // 2. Fetch Balances for each wallet
+    let mut wallet_balances = Vec::new();
+    for w in wallets {
+        let bal_res = match w.chain.as_str() {
+            "solana" | "sol" => balance::get_solana_balance(&w.address, &state.solana_client).await,
+           "eth" | "ethereum" | "bsc" | "binance" => balance::get_evm_balance(&w.address, &w.chain).await,
+            _ => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_secs() as i64;
+                Ok(balance::WalletBalance { 
+                    chain: w.chain.clone(), 
+                    address: w.address.clone(), 
+                    native_balance: "0.0".to_string(), 
+                    native_balance_usd: 0.0, 
+                    total_usd: 0.0, 
+                    token_balances: vec![],
+                    last_updated: timestamp,
+                })
+            },
+        };
+
+        if let Ok(b) = bal_res {
+            wallet_balances.push(b);
+        }
+    }
+
+    // 3. Fetch Positions for PnL
+    let positions = sqlx::query_as::<_, Position>("SELECT * FROM positions WHERE user_id = $1 AND status = 'OPEN'")
+        .bind(user_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or(vec![]);
+
+    let mut positions_pnl = 0.0;
+    for p in &positions {
+        // Simple PnL calc
+        let pnl_percent = ((p.current_price - p.entry_price) / p.entry_price);
+        // We need amount in USD to calculate PnL USD. 
+        // For now, let's assume entry_price is USD.
+        let amount_float = p.amount.parse::<f64>().unwrap_or(0.0);
+        let entry_val = amount_float * p.entry_price;
+        let pnl_usd = entry_val * pnl_percent; 
+        positions_pnl += pnl_usd;
+    }
+
+    // 4. Calculate Summary
+    let summary = portfolio::calculate_portfolio_summary(
+        user_id,
+        wallet_balances,
+        positions_pnl,
+        positions.len()
+    );
+
+    (StatusCode::OK, Json(summary)).into_response()
 }

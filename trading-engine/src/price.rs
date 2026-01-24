@@ -46,9 +46,20 @@ pub async fn fetch_token_price(chain: &str, token: &str) -> Result<TokenPrice, S
     // Parse DexScreener response
     let pairs = json.get("pairs")
         .and_then(|p| p.as_array())
-        .ok_or_else(|| "No pairs found".to_string())?;
+        .ok_or_else(|| {
+            let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
+            if network == "devnet" || network == "testnet" {
+                tracing::warn!("⚠️ [{}] No trading pairs found for token {}", network.to_uppercase(), &token[..8]);
+                tracing::warn!("   This is expected on devnet for tokens without liquidity");
+            }
+            "No pairs found".to_string()
+        })?;
     
     if pairs.is_empty() {
+        let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
+        if network == "devnet" || network == "testnet" {
+            tracing::warn!("⚠️ [{}] No trading pairs found for token {}", network.to_uppercase(), &token[..8]);
+        }
         return Err("No trading pairs found for token".to_string());
     }
     

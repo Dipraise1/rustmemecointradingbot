@@ -263,7 +263,6 @@ bot.callbackQuery('portfolio', async (ctx) => {
       .text('💼 Wallets', 'wallet')
       .text('📊 Positions', 'positions')
       .text('💰 Trading', 'menu_trading').row()
-      .text('🔄 Refresh', 'portfolio')
       .text('🔙 Back', 'back_main');
 
     await safeEditMessage(ctx, message, { parse_mode: 'HTML', reply_markup: keyboard });
@@ -533,17 +532,24 @@ bot.command('start', async (ctx) => {
       message += '━━━━━━━━━━━━━━━━━━━━\n\n';
       message += 'Use the menu below to manage your portfolio:';
 
-      // Delete the loading message and send new one
+      // Edit the loading message
       try {
-        await ctx.api.deleteMessage(ctx.chat!.id, loadingMsg.message_id);
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loadingMsg.message_id,
+          message,
+          {
+            parse_mode: 'HTML',
+            reply_markup: getMainKeyboard(),
+          }
+        );
       } catch {
-        // Ignore if can't delete
+        // If edit fails, send new message
+        await ctx.reply(message, {
+          parse_mode: 'HTML',
+          reply_markup: getMainKeyboard(),
+        });
       }
-      
-      await ctx.reply(message, {
-        parse_mode: 'HTML',
-        reply_markup: getMainKeyboard(),
-      });
     } else {
       // New user - show welcome message
       const welcomeMessage = `
@@ -1640,188 +1646,6 @@ bot.callbackQuery('buy', async (ctx) => {
     await ctx.reply(`❌ Error checking wallet: ${error.message}`);
   }
 });
-
-// ==================== TOGGLE HANDLERS ====================
-
-// Toggle Safety Checks
-bot.callbackQuery('toggle_safety', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  ctx.session.settings.ignoreSafety = !ctx.session.settings.ignoreSafety;
-  
-  const status = ctx.session.settings.ignoreSafety ? 'DISABLED ⚠️' : 'ENABLED 🛡️';
-  await ctx.reply(
-    `${ctx.session.settings.ignoreSafety ? '⚠️' : '🛡️'} <b>Safety Checks ${status}</b>\n\n` +
-    (ctx.session.settings.ignoreSafety 
-      ? '⚠️ <b>Warning:</b> You can now buy risky tokens without security warnings.\nUse with caution!' 
-      : '✅ Tokens will be checked for safety before purchase.'),
-    { parse_mode: 'HTML' }
-  );
-});
-
-// Toggle Simulation Mode
-bot.callbackQuery('toggle_simulation', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  ctx.session.settings.simulationMode = !ctx.session.settings.simulationMode;
-  
-  const status = ctx.session.settings.simulationMode ? 'ON 🧪' : 'OFF 🚀';
-  await ctx.reply(
-    `${ctx.session.settings.simulationMode ? '🧪' : '🚀'} <b>Simulation Mode ${status}</b>\n\n` +
-    (ctx.session.settings.simulationMode 
-      ? '🧪 Trades will be simulated (no real transactions)' 
-      : '🚀 Trades will be executed for real'),
-    { parse_mode: 'HTML' }
-  );
-});
-
-// Toggle Bundler Mode
-bot.callbackQuery('toggle_bundler', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  ctx.session.settings.bundlerMode = !ctx.session.settings.bundlerMode;
-  
-  const status = ctx.session.settings.bundlerMode ? 'ON 📦' : 'OFF';
-  await ctx.reply(
-    `📦 <b>Bundler Mode ${status}</b>\n\n` +
-    (ctx.session.settings.bundlerMode 
-      ? '📦 Transactions will be bundled to save on gas' 
-      : 'Transactions will be sent individually'),
-    { parse_mode: 'HTML' }
-  );
-});
-
-// Help callback
-bot.callbackQuery('help', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  
-  const helpText = `
-📚 <b>Quick Command Reference</b>
-
-<b>💰 Trading Commands:</b>
-<code>&lt;token&gt; buy &lt;amount&gt;</code> - Buy tokens
-<code>&lt;token&gt; swap &lt;amount&gt;</code> - Swap (same as buy)
-<code>&lt;token&gt; sell &lt;amount&gt;</code> - Sell position
-
-<b>Examples:</b>
-<code>So11...abc 0.5 buy</code>
-<code>4fERe7x...u6 0.2 swap</code>
-
-<b>⚙️ Settings:</b>
-• Toggle Safety Checks - Bypass token security
-• Simulation Mode - Test without real trades
-• Bundler Mode - Save gas by bundling
-
-<b>📊 Other Commands:</b>
-/start - View portfolio
-/positions - Active positions
-/wallet - View wallets
-/settings - Configure bot
-/help - Show this help
-
-<b>�� Tips:</b>
-• Use /settings to toggle safety checks
-• "swap" and "buy" work the same way
-  `;
-  
-  const keyboard = new InlineKeyboard()
-    .text('⚙️ Settings', 'settings')
-    .text('💰 Buy', 'buy')
-    .text('📊 Positions', 'positions').row()
-    .text('🔙 Back', 'back_main');
-  
-  await ctx.editMessageText(helpText, { parse_mode: 'HTML', reply_markup: keyboard });
-});
-
-
-// ==================== TOGGLE HANDLERS ====================
-
-// Toggle Safety Checks
-bot.callbackQuery('toggle_safety', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  ctx.session.settings.ignoreSafety = !ctx.session.settings.ignoreSafety;
-  
-  const status = ctx.session.settings.ignoreSafety ? 'DISABLED ⚠️' : 'ENABLED 🛡️';
-  await ctx.reply(
-    `${ctx.session.settings.ignoreSafety ? '⚠️' : '🛡️'} <b>Safety Checks ${status}</b>\n\n` +
-    (ctx.session.settings.ignoreSafety 
-      ? '⚠️ <b>Warning:</b> You can now buy risky tokens without security warnings.\nUse with caution!' 
-      : '✅ Tokens will be checked for safety before purchase.'),
-    { parse_mode: 'HTML' }
-  );
-});
-
-// Toggle Simulation Mode
-bot.callbackQuery('toggle_simulation', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  ctx.session.settings.simulationMode = !ctx.session.settings.simulationMode;
-  
-  const status = ctx.session.settings.simulationMode ? 'ON 🧪' : 'OFF 🚀';
-  await ctx.reply(
-    `${ctx.session.settings.simulationMode ? '🧪' : '🚀'} <b>Simulation Mode ${status}</b>\n\n` +
-    (ctx.session.settings.simulationMode 
-      ? '🧪 Trades will be simulated (no real transactions)' 
-      : '🚀 Trades will be executed for real'),
-    { parse_mode: 'HTML' }
-  );
-});
-
-// Toggle Bundler Mode
-bot.callbackQuery('toggle_bundler', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  ctx.session.settings.bundlerMode = !ctx.session.settings.bundlerMode;
-  
-  const status = ctx.session.settings.bundlerMode ? 'ON 📦' : 'OFF';
-  await ctx.reply(
-    `📦 <b>Bundler Mode ${status}</b>\n\n` +
-    (ctx.session.settings.bundlerMode 
-      ? '📦 Transactions will be bundled to save on gas' 
-      : 'Transactions will be sent individually'),
-    { parse_mode: 'HTML' }
-  );
-});
-
-// Help callback
-bot.callbackQuery('help', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  
-  const helpText = `
-📚 <b>Quick Command Reference</b>
-
-<b>💰 Trading Commands:</b>
-<code>&lt;token&gt; buy &lt;amount&gt;</code> - Buy tokens
-<code>&lt;token&gt; swap &lt;amount&gt;</code> - Swap (same as buy)
-<code>&lt;token&gt; sell &lt;amount&gt;</code> - Sell position
-
-<b>Examples:</b>
-<code>So11...abc 0.5 buy</code>
-<code>4fERe7x...u6 0.2 swap</code>
-<code>0x123...xyz 50 sell</code>
-
-<b>⚙️ Settings:</b>
-• Toggle Safety Checks - Bypass token security
-• Simulation Mode - Test without real trades
-• Bundler Mode - Save gas by bundling
-
-<b>📊 Other Commands:</b>
-/start - View portfolio
-/positions - Active positions
-/wallet - View wallets
-/settings - Configure bot
-/help - Show this help
-
-<b>💡 Tips:</b>
-• Use /settings to toggle safety checks
-• "swap" and "buy" work the same way
-• Amounts can be in tokens or %
-  `;
-  
-  const keyboard = new InlineKeyboard()
-    .text('⚙️ Settings', 'settings')
-    .text('💰 Buy', 'buy')
-    .text('📊 Positions', 'positions').row()
-    .text('🔙 Back', 'back_main');
-  
-  await ctx.editMessageText(helpText, { parse_mode: 'HTML', reply_markup: keyboard });
-});
-
 
 // Positions button
 // Positions button with Pagination (Carousel)
@@ -4261,23 +4085,7 @@ async function startBot() {
   // Start bot
   try {
     await bot.start({
-      onStart: async (botInfo) => {
-        // Set bot commands menu
-        try {
-          await bot.api.setMyCommands([
-            { command: 'start', description: '🏠 View portfolio' },
-            { command: 'buy', description: '💰 Buy tokens' },
-            { command: 'sell', description: '💸 Sell position' },
-            { command: 'positions', description: '📊 View positions' },
-            { command: 'wallet', description: '💼 View wallets' },
-            { command: 'settings', description: '⚙️ Bot settings' },
-            { command: 'help', description: '❓ Show help' },
-          ]);
-          console.log('✅ Slash commands menu configured');
-        } catch (error) {
-          console.error('⚠️  Failed to set commands menu:', error);
-        }
-        
+      onStart: (botInfo) => {
         console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.log('✅ Bot started successfully!');
         console.log(`   Username: @${botInfo.username}`);
