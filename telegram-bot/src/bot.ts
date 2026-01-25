@@ -65,7 +65,29 @@ type MyContext = Context & {
 };
 
 // ==================== BOT SETUP ====================
-const bot = new Bot<MyContext>(BOT_TOKEN);
+const bot = new Bot<MyContext>(BOT_TOKEN, {
+  client: {
+    timeout: 60000, // Increase timeout to 60 seconds for slow networks
+  }
+});
+
+// Global error handler to prevent bot from crashing on network issues
+bot.catch((err) => {
+  const ctx = err.ctx;
+  console.error(`❌ Error while handling update ${ctx.update.update_id}:`);
+  const e = err.error;
+  
+  if (e instanceof GrammyError) {
+    console.error("   Telegram API Error:", e.description);
+  } else if (e instanceof HttpError) {
+    console.error("   Network/HTTP Error:", e.message);
+    if (e.message.includes('timeout') || e.message.includes('TimeoutError')) {
+      console.warn("   ⚠️ Telegram API timeout detected. Your network might be slow.");
+    }
+  } else {
+    console.error("   Unknown error:", e);
+  }
+});
 
 // Session middleware
 bot.use(session({
@@ -280,6 +302,17 @@ function formatPnL(pnl: number): string {
   const emoji = pnl >= 0 ? '🟢' : '🔴';
   const sign = pnl >= 0 ? '+' : '';
   return `${emoji} ${sign}${formatNumber(pnl)}%`;
+}
+
+// Simple HTML escaping helper
+function escapeHTML(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 // ==================== COMMANDS ====================
@@ -4335,9 +4368,9 @@ bot.on('message:text', async (ctx) => {
     
     // Token symbol and address
     if (price?.symbol) {
-      message += `<b>Buy ${price.symbol}</b> 📊\n`;
+      message += `<b>Buy ${escapeHTML(price.symbol)}</b> 📊\n`;
     }
-    message += `<code>${token}</code>\n\n`;
+    message += `<code>${escapeHTML(token)}</code>\n\n`;
     
     // Balance
     message += `<b>Balance:</b> 0 SOL — W2 👍\n`;
@@ -4368,7 +4401,7 @@ bot.on('message:text', async (ctx) => {
     if (price) {
       const tokens = (exampleAmount / price.price);
       const impact = calculatePriceImpact(exampleAmount, price.liquidity_usd);
-      message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${price.symbol || 'tokens'} ($${formatNumber(exampleAmount * price.price, 2)})\n`;
+      message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${escapeHTML(price.symbol || 'tokens')} ($${formatNumber(exampleAmount * price.price, 2)})\n`;
       message += `<b>Price Impact:</b> ${impact.toFixed(2)}%\n`;
     }
     
