@@ -451,7 +451,17 @@ async fn execute_solana_sell(
          ).map_err(|e| format!("Failed to create vault address: {}", e))?;
          
          let sol_to_return_lamports = (sol_to_return * 1_000_000_000.0) as u64;
+         let original_sol_lamports = (original_sol * 1_000_000_000.0) as u64;
          
+         // SIMULATION FIX: The vault only holds the principal (original_sol).
+         // It cannot pay out profits because no one funded it with extra SOL.
+         // We cap the return amount to what's available in the vault.
+         let actual_send_lamports = std::cmp::min(sol_to_return_lamports, original_sol_lamports);
+         
+         if actual_send_lamports < sol_to_return_lamports {
+             tracing::warn!("⚠️  [DEVNET] Capping return amount to vault balance (Principal only). User won't receive on-chain profit.");
+         }
+
          // Use transfer_with_seed to transfer FROM the vault back to the user
          // This works because the vault was created with create_with_seed using user's pubkey as base
          let ix = solana_sdk::system_instruction::transfer_with_seed(
@@ -460,7 +470,7 @@ async fn execute_solana_sell(
             vault_seed.clone(),      // Seed used to create vault
             &solana_sdk::system_program::id(), // Owner
             &keypair.pubkey(),       // To: user
-            sol_to_return_lamports,  // Amount to return (original + profit/loss)
+            actual_send_lamports,    // Amount to return (capped at principal)
         );
         
         // Get Blockhash (with retry logic)
