@@ -2,12 +2,24 @@
 // File: telegram-bot/src/bot.ts
 // Install: bun add grammy dotenv
 
-import { Bot, Context, InlineKeyboard, session, GrammyError, HttpError } from 'grammy';
+import { Bot, InlineKeyboard, session, GrammyError, HttpError } from 'grammy';
 import { config } from 'dotenv';
+import { sendChatMessage, analyzeToken } from './eliza-client.js';
+import { 
+  RUST_API, 
+  SessionData, 
+  TradingSettings, 
+  Position, 
+  MyContext, 
+  callRustAPI, 
+  formatNumber, 
+  formatPnL, 
+  safeEditMessage 
+} from './shared.js';
+import { setupTrojanUI } from './trojan_ui.js';
 
 config();
 
-const RUST_API = process.env.RUST_API_URL || 'http://localhost:3000';
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 
 if (!BOT_TOKEN) {
@@ -15,79 +27,8 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// ==================== TYPES ====================
-interface SessionData {
-  walletCreated: boolean;
-  settings: TradingSettings;
-  awaitingInput?: 'buy' | 'sell' | 'token_check' | 'import_wallet' | 'import_data' | 'custom_amount' | 'bundler_add' | 'whale_alert' | 'grid_create';
-  pendingBuy?: {
-    token: string;
-    chain: string;
-  };
-}
-
-interface TradingSettings {
-  defaultChain: 'solana' | 'eth' | 'bsc';
-  buyAmount: number;
-  slippage: number;
-  takeProfitPercent: number;
-  stopLossPercent: number;
-  autoTrade: boolean;
-  // New features
-  preset: 'custom' | 'safe' | 'degen' | 'snipe';
-  simulationMode: boolean;
-  bundlerMode: boolean;
-  ignoreSafety: boolean; // Bypass security checks
-}
-
-interface Position {
-  position: {
-    position_id?: string;
-    user_id: number;
-    chain: string;
-    token: string;
-    token_address?: string;
-    amount: string;
-    entry_price: number;
-    current_price: number;
-    take_profit_percent: number;
-    stop_loss_percent: number;
-    timestamp: number;
-  };
-  pnl_percent: number;
-  pnl_usd: number;
-  should_close: boolean;
-  reason?: string;
-}
-
-type MyContext = Context & {
-  session: SessionData;
-};
-
 // ==================== BOT SETUP ====================
-const bot = new Bot<MyContext>(BOT_TOKEN, {
-  client: {
-    timeout: 60000, // Increase timeout to 60 seconds for slow networks
-  }
-});
-
-// Global error handler to prevent bot from crashing on network issues
-bot.catch((err) => {
-  const ctx = err.ctx;
-  console.error(`❌ Error while handling update ${ctx.update.update_id}:`);
-  const e = err.error;
-  
-  if (e instanceof GrammyError) {
-    console.error("   Telegram API Error:", e.description);
-  } else if (e instanceof HttpError) {
-    console.error("   Network/HTTP Error:", e.message);
-    if (e.message.includes('timeout') || e.message.includes('TimeoutError')) {
-      console.warn("   ⚠️ Telegram API timeout detected. Your network might be slow.");
-    }
-  } else {
-    console.error("   Unknown error:", e);
-  }
-});
+const bot = new Bot<MyContext>(BOT_TOKEN);
 
 // Session middleware
 bot.use(session({
@@ -108,108 +49,8 @@ bot.use(session({
   }),
 }));
 
-// ==================== HELPER FUNCTIONS ====================
-// Helper function to safely edit messages (handles "message not modified" error)
-async function safeEditMessage(ctx: MyContext, text: string, options?: any) {
-  try {
-    await ctx.editMessageText(text, options);
-  } catch (error: any) {
-    // Ignore "message is not modified" error - it means the message is already correct
-    if (error.error_code === 400 && error.description?.includes('message is not modified')) {
-      // Message is already correct, no need to update
-      return;
-    }
-    // For other errors, try to reply instead
-    try {
-      await ctx.reply(text, options);
-    } catch (replyError) {
-      // If reply also fails, just log it
-      console.error('Failed to edit or reply:', replyError);
-    }
-  }
-}
-
-async function callRustAPI(endpoint: string, method: string = 'GET', body?: any, timeout: number = 30000) {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-    const options: RequestInit = {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-    };
-
-    if (body && method !== 'GET') {
-      options.body = JSON.stringify(body);
-    }
-
-    const response = await fetch(`${RUST_API}${endpoint}`, options);
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(`API error (${response.status}): ${errorText}`);
-    }
-
-    const text = await response.text();
-    try {
-      return JSON.parse(text);
-    } catch (e) {
-      const safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 200);
-      throw new Error(`Failed to parse JSON. Response: "${safeText}..."`);
-    }
-  } catch (error: any) {
-    if (error.name === 'AbortError') {
-      throw new Error(`API call timeout after ${timeout}ms`);
-    }
-    
-    // Parse error message for better logging
-    let errorDetails = error.message || error;
-    let parsedError: any = null;
-    
-    // Try to extract JSON from error message
-    const jsonMatch = errorDetails.match(/API error \((\d+)\): (.+)/);
-    if (jsonMatch) {
-      try {
-        parsedError = JSON.parse(jsonMatch[2]);
-      } catch (e) {
-        // Not JSON, use raw message
-      }
-    }
-    
-    // Categorize errors for better logging
-    const isTokenRisk = errorDetails.includes('Token Risk') || 
-                        (errorDetails.includes('400') && errorDetails.includes('Risk'));
-    const isAccountNotFound = parsedError?.warnings?.some((w: string) => w.includes('AccountNotFound')) ||
-                              errorDetails.includes('AccountNotFound');
-    const isNoPairsFound = errorDetails.includes('No pairs found');
-    
-    // Log errors with context
-    if (isAccountNotFound) {
-      // Devnet account lookup failures - provide helpful context
-      const pubkey = errorDetails.match(/pubkey=([a-zA-Z0-9]+)/)?.[1] || 'unknown';
-      console.warn(`⚠️ [DEVNET] Account not found: ${pubkey.slice(0, 8)}...${pubkey.slice(-4)}`);
-      console.warn(`   This is expected on devnet for mainnet token addresses.`);
-      console.warn(`   Endpoint: ${endpoint}`);
-    } else if (isTokenRisk) {
-      // Token risk warnings - don't spam logs
-      // Silent - these are expected security checks
-    } else if (isNoPairsFound) {
-      // Price lookup failures on devnet
-      console.warn(`⚠️ [DEVNET] No trading pairs found for token`);
-      console.warn(`   Endpoint: ${endpoint}`);
-    } else {
-      // Unexpected errors - log with full details
-      console.error(`❌ API Error (${endpoint}):`, errorDetails);
-      if (parsedError) {
-        console.error(`   Details:`, JSON.stringify(parsedError, null, 2));
-      }
-    }
-    
-    throw error;
-  }
-}
+// Initialize Trojan UI
+setupTrojanUI(bot);
 
 // ==================== KEYBOARD LAYOUTS ====================
 // All buttons arranged horizontally in rows of 3 - All main features visible
@@ -226,7 +67,8 @@ function getMainKeyboard(): InlineKeyboard {
     .text('⚙️ Settings', 'settings').row()
     .text('🔍 Check Token', 'check_token')
     .text('📥 Import', 'import_data')
-    .text('❓ Help', 'help').row();
+    .text('❓ Help', 'help').row()
+    .text('🤖 AI Assistant', 'ai_chat').row();
 }
 
 function getTradingMenuKeyboard(): InlineKeyboard {
@@ -294,26 +136,7 @@ bot.callbackQuery('portfolio', async (ctx) => {
   }
 });
 
-function formatNumber(num: number, decimals: number = 2): string {
-  return num.toFixed(decimals);
-}
 
-function formatPnL(pnl: number): string {
-  const emoji = pnl >= 0 ? '🟢' : '🔴';
-  const sign = pnl >= 0 ? '+' : '';
-  return `${emoji} ${sign}${formatNumber(pnl)}%`;
-}
-
-// Simple HTML escaping helper
-function escapeHTML(text: string): string {
-  if (!text) return '';
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
 
 // ==================== COMMANDS ====================
 
@@ -2671,11 +2494,153 @@ bot.callbackQuery('back_main', async (ctx) => {
   );
 });
 
+// AI Chat handler
+bot.callbackQuery('ai_chat', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  ctx.session.awaitingInput = 'ai_chat';
+  await safeEditMessage(
+    ctx,
+    '🤖 <b>AI Assistant</b>\n\n' +
+    '━━━━━━━━━━━━━━━━━━━━\n\n' +
+    'Ask me anything about trading, tokens, or your portfolio!\n\n' +
+    'Examples:\n' +
+    '• "Should I buy this token?"\n' +
+    '• "Analyze my portfolio risk"\n' +
+    '• "What is Jupiter Aggregator?"\n' +
+    '• "Explain grid trading"\n\n' +
+    'Type your question below:',
+    { parse_mode: 'HTML', reply_markup: new InlineKeyboard().text('🔙 Back', 'back_main') }
+  );
+});
+
+// AI Analyze Token handler
+bot.callbackQuery(/^ai_analyze_token:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery('Analyzing token with AI...');
+  const token = ctx.match[1];
+  const settings = ctx.session.settings;
+
+  try {
+    const result = await analyzeToken(settings.defaultChain, token);
+
+    if (result.success && result.analysis) {
+      const analysis = result.analysis;
+      let message = `🤖 <b>AI Token Analysis</b>\n\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+      message += `<b>Summary:</b>\n${analysis.summary}\n\n`;
+      message += `<b>Risk Assessment:</b>\n${analysis.riskAssessment}\n\n`;
+      
+      if (analysis.recommendations.length > 0) {
+        message += `<b>Recommendations:</b>\n`;
+        analysis.recommendations.forEach((rec, i) => {
+          message += `${i + 1}. ${rec}\n`;
+        });
+        message += `\n`;
+      }
+
+      message += `<b>Market Sentiment:</b> ${analysis.marketSentiment === 'bullish' ? '📈 Bullish' : analysis.marketSentiment === 'bearish' ? '📉 Bearish' : '➡️ Neutral'}\n`;
+      message += `<b>Confidence:</b> ${(analysis.confidence * 100).toFixed(0)}%`;
+
+      await ctx.reply(message, {
+        parse_mode: 'HTML',
+        reply_markup: new InlineKeyboard().text('🔙 Back', 'back_main'),
+      });
+    } else {
+      await ctx.reply(
+        `❌ <b>AI Analysis Failed</b>\n\n${result.error || 'Unknown error'}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  } catch (error: any) {
+    await ctx.reply(
+      `❌ <b>Error</b>\n\n${error.message}`,
+      { parse_mode: 'HTML' }
+    );
+  }
+});
+
 // ==================== MESSAGE HANDLERS ====================
 
 // Handle awaiting input
 bot.on('message:text', async (ctx) => {
-  if (!ctx.session.awaitingInput) return;
+  // Handle AI chat
+  if (ctx.session.awaitingInput === 'ai_chat') {
+    const message = ctx.message.text;
+    const thinkingMsg = await ctx.reply('🤖 <i>Thinking...</i>', { parse_mode: 'HTML' });
+
+    try {
+      const result = await sendChatMessage(ctx.from!.id, message);
+
+      // Delete thinking message
+      try {
+        await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
+      } catch {}
+
+      if (result.success && result.response) {
+        await ctx.reply(
+          `🤖 <b>AI Assistant</b>\n\n${result.response}`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: new InlineKeyboard().text('🔙 Back', 'back_main'),
+          }
+        );
+      } else {
+        await ctx.reply(
+          `❌ <b>Error</b>\n\n${result.error || 'Failed to get AI response'}\n\nPlease try again or check if ElizaOS service is running.`,
+          { parse_mode: 'HTML' }
+        );
+      }
+    } catch (error: any) {
+      // Delete thinking message
+      try {
+        await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
+      } catch {}
+      
+      await ctx.reply(
+        `❌ <b>Error</b>\n\n${error.message}\n\nPlease check if ElizaOS service is running on ${process.env.ELIZA_API_URL || 'http://localhost:3001'}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    ctx.session.awaitingInput = undefined;
+    return;
+  }
+
+  if (!ctx.session.awaitingInput) {
+    // Check if it's a natural language message (not a command)
+    const text = ctx.message.text.trim();
+    const isCommand = text.startsWith('/') || 
+                     /^(So11[a-zA-Z0-9]+|0x[a-fA-F0-9]{40}|[a-zA-Z0-9]{32,44})\s+(buy|sell|swap)\s+([\d.]+)$/i.test(text);
+    
+    if (!isCommand && text.length > 5) {
+      // Send to ElizaOS for processing
+      try {
+        const processingMsg = await ctx.reply('🤖 <i>Processing with AI...</i>', { parse_mode: 'HTML' });
+        const result = await sendChatMessage(ctx.from!.id, text);
+
+        // Delete processing message
+        try {
+          await ctx.api.deleteMessage(ctx.chat!.id, processingMsg.message_id);
+        } catch {}
+
+        if (result.success && result.response) {
+          await ctx.reply(
+            `🤖 <b>AI Response</b>\n\n${result.response}`,
+            {
+              parse_mode: 'HTML',
+              reply_markup: new InlineKeyboard().text('💬 Chat with AI', 'ai_chat').text('🔙 Main Menu', 'back_main'),
+            }
+          );
+        } else {
+          // Silently fail for natural language - don't interrupt user experience
+          console.warn('AI processing failed:', result.error);
+        }
+      } catch (error: any) {
+        // Silently fail - don't interrupt normal flow
+        console.error('AI processing error:', error);
+      }
+    }
+    return;
+  }
 
   const input = ctx.message.text;
 
@@ -4368,9 +4333,9 @@ bot.on('message:text', async (ctx) => {
     
     // Token symbol and address
     if (price?.symbol) {
-      message += `<b>Buy ${escapeHTML(price.symbol)}</b> 📊\n`;
+      message += `<b>Buy ${price.symbol}</b> 📊\n`;
     }
-    message += `<code>${escapeHTML(token)}</code>\n\n`;
+    message += `<code>${token}</code>\n\n`;
     
     // Balance
     message += `<b>Balance:</b> 0 SOL — W2 👍\n`;
@@ -4401,7 +4366,7 @@ bot.on('message:text', async (ctx) => {
     if (price) {
       const tokens = (exampleAmount / price.price);
       const impact = calculatePriceImpact(exampleAmount, price.liquidity_usd);
-      message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${escapeHTML(price.symbol || 'tokens')} ($${formatNumber(exampleAmount * price.price, 2)})\n`;
+      message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${price.symbol || 'tokens'} ($${formatNumber(exampleAmount * price.price, 2)})\n`;
       message += `<b>Price Impact:</b> ${impact.toFixed(2)}%\n`;
     }
     
