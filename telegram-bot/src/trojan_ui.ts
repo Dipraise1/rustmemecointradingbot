@@ -1,5 +1,5 @@
 import { Bot, InlineKeyboard } from 'grammy';
-import { callRustAPI, formatNumber, MyContext } from './shared.js';
+import { callRustAPI, formatNumber, formatPnL, MyContext } from './shared.js';
 
 // ==================== TROJAN-STYLE TOKEN INFO HANDLER ====================
 // When user pastes just a contract address, show rich token info like Trojan bot
@@ -23,14 +23,17 @@ export function setupTrojanUI(bot: Bot<MyContext>) {
     const loadingMsg = await ctx.reply('🔍 <b>Fetching token info...</b>', { parse_mode: 'HTML' });
     
     try {
-      // Fetch token info, price, and security check in parallel
-      const [priceData, securityData] = await Promise.allSettled([
-        callRustAPI(`/api/price/${settings.defaultChain}/${token}`).catch(() => null),
-        callRustAPI(`/api/security-check/${settings.defaultChain}/${token}`).catch(() => null)
+      // Fetch analysis and positions concurrently
+      const [analysisResult, positionsResult] = await Promise.allSettled([
+        callRustAPI(`/api/check/${settings.defaultChain}/${token}`).catch(() => null),
+        callRustAPI(`/api/positions/${ctx.from!.id}`).catch(() => []),
       ]);
       
-      const price = priceData.status === 'fulfilled' ? priceData.value : null;
-      const security = securityData.status === 'fulfilled' ? securityData.value : null;
+      const analysis = analysisResult.status === 'fulfilled' ? analysisResult.value : null;
+      const positions = positionsResult.status === 'fulfilled' ? positionsResult.value : [];
+      
+      // Check if we have an active position on this token
+      const myPosition = positions.find((p: any) => p.position.token === token || p.position.token_address === token);
       
       // Get user's balance for this token
       const wallets = await callRustAPI(`/api/wallets/${ctx.from!.id}`).catch(() => []);
@@ -40,8 +43,8 @@ export function setupTrojanUI(bot: Bot<MyContext>) {
       let message = `<b>🪙 Token Info</b>\n\n`;
       
       // Token symbol and address
-      if (price?.symbol) {
-        message += `<b>Buy ${price.symbol}</b> 📊\n`;
+      if (analysis?.symbol) {
+        message += `<b>Buy ${analysis.symbol}</b> 📊\n`;
       }
       message += `<code>${token}</code>\n\n`;
       
@@ -49,32 +52,47 @@ export function setupTrojanUI(bot: Bot<MyContext>) {
       message += `<b>Balance:</b> 0 SOL — W2 👍\n`;
       
       // Price info
-      if (price) {
-        message += `<b>Price:</b> $${formatNumber(price.price, 8)}\n`;
-        message += `<b>LIQ:</b> $${formatNumber(price.liquidity_usd / 1000, 2)}K — `;
-        message += `<b>MC:</b> $${formatNumber(price.market_cap / 1000, 2)}K\n`;
+      if (analysis) {
+        message += `<b>Price:</b> $${formatNumber(analysis.price_usd, 8)}\n`;
+        message += `<b>LIQ:</b> $${formatNumber(analysis.liquidity_usd / 1000, 2)}K — `;
+        message += `<b>MC:</b> $${formatNumber(analysis.market_cap / 1000, 2)}K\n`;
+        message += `<b>FDV:</b> $${formatNumber(analysis.fdv / 1000, 2)}K — `;
+        message += `<b>Age:</b> ${analysis.pair_age_hours.toFixed(1)}h\n\n`;
+        
+        // SCORE & BUNDLER SECTION (Enhanced Trojan View)
+        let scoreEmoji = '🟢';
+        if (analysis.total_score < 70) scoreEmoji = '🟡';
+        if (analysis.total_score < 40) scoreEmoji = '🔴';
+        
+        message += `${scoreEmoji} <b>Score: ${analysis.total_score.toFixed(1)}/100</b>\n`;
+        
+        if (analysis.bundler_details) {
+            const b = analysis.bundler_details;
+            if (b.bundled_percentage > 30) {
+               message += `⚠️ <b>BUNDLER: ${b.bundled_percentage.toFixed(1)}% RISK!</b>\n`;
+            } else {
+               message += `✅ <b>Bundler Safe: ${b.bundled_percentage.toFixed(1)}%</b>\n`;
+            }
+        }
       } else {
         message += `<b>Price:</b> Not available\n`;
         message += `<b>LIQ:</b> Unknown — <b>MC:</b> Unknown\n`;
       }
       
-      // Security status
-      if (security) {
-        if (security.is_safe) {
-          message += `<b>Renounced</b> ✅\n\n`;
-        } else {
-          message += `<b>⚠️ Risk Detected</b>\n\n`;
-        }
-      } else {
-        message += `\n`;
+      // Active Position Info
+      if (myPosition) {
+        message += `\n🟢 <b>Active Position</b>\n`;
+        message += `Entry: $${formatNumber(myPosition.position.entry_price, 6)} | Cur: $${formatNumber(myPosition.position.current_price, 6)}\n`;
+        message += `PnL: ${formatPnL(myPosition.pnl_percent)} (Value: $${formatNumber(myPosition.pnl_usd)}) \n`;
       }
+      message += '\n'; // Spacer
       
       // Price impact calculator (example with 0.1 SOL)
       const exampleAmount = 0.1;
-      if (price) {
-        const tokens = (exampleAmount / price.price);
-        const impact = calculatePriceImpact(exampleAmount, price.liquidity_usd);
-        message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${price.symbol || 'tokens'} ($${formatNumber(exampleAmount * price.price, 2)})\n`;
+      if (analysis) {
+        const tokens = (exampleAmount / (analysis.price_usd / 140)); // Approx SOL
+        const impact = (exampleAmount * 140) / (analysis.liquidity_usd) * 100;
+        message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${analysis.symbol || 'tokens'} ($${formatNumber(exampleAmount * 140, 2)})\n`;
         message += `<b>Price Impact:</b> ${impact.toFixed(2)}%\n`;
       }
       

@@ -46,6 +46,19 @@ CREATE TABLE IF NOT EXISTS positions (
     closed_at TIMESTAMP WITH TIME ZONE
 );
 
+-- Risk Profiles Table (New)
+CREATE TABLE IF NOT EXISTS risk_profiles (
+    user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
+    max_trade_size_usd DOUBLE PRECISION DEFAULT 100.0,
+    max_daily_loss_usd DOUBLE PRECISION DEFAULT 50.0,
+    max_open_positions INTEGER DEFAULT 5,
+    default_stop_loss_percent DOUBLE PRECISION DEFAULT 15.0,
+    default_take_profit_percent DOUBLE PRECISION DEFAULT 30.0,
+    kill_switch_enabled BOOLEAN DEFAULT FALSE,
+    blacklist_enabled BOOLEAN DEFAULT TRUE,
+    last_updated BIGINT
+);
+
 -- Transactions/History table
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id VARCHAR(100) PRIMARY KEY,

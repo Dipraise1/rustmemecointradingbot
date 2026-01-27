@@ -732,6 +732,43 @@ bot.command('positions', async (ctx) => {
   }
 });
 
+// /history command
+bot.command('history', async (ctx) => {
+  try {
+    await ctx.reply('📜 Fetching trade history...');
+
+    const history = await callRustAPI(`/api/history/${ctx.from!.id}`);
+
+    if (!Array.isArray(history) || history.length === 0) {
+      return ctx.reply('📭 No trade history found.');
+    }
+
+    let message = '<b>📜 Trade History (Last 50)</b>\n\n';
+
+    for (const tx of history) {
+      const isBuy = tx.type_.toUpperCase() === 'BUY';
+      const emoji = isBuy ? '🟢' : '🔴';
+      const pnl = tx.profit_loss ? `(${formatPnL(tx.profit_loss)})` : '';
+      const date = new Date(tx.timestamp).toLocaleString();
+
+      message += `${emoji} <b>${tx.type_}</b> | ${date}\n`;
+      message += `Token: <code>${tx.token_address.slice(0, 8)}...</code>\n`;
+      message += `Amount: ${tx.amount} @ $${formatNumber(tx.price, 6)}\n`;
+      if (!isBuy) message += `PnL: $${formatNumber(tx.profit_loss || 0)} ${pnl}\n`;
+      message += `TX: <code>${tx.tx_hash.slice(0, 8)}...</code>\n\n`;
+    }
+
+    // Split message if too long (Telegram limit 4096 chars)
+    if (message.length > 4000) {
+      message = message.slice(0, 4000) + '... (truncated)';
+    }
+
+    await ctx.reply(message, { parse_mode: 'HTML' });
+  } catch (error: any) {
+    await ctx.reply(`❌ Error: ${error.message}`);
+  }
+});
+
 // /settings command
 bot.command('settings', async (ctx) => {
   const settings = ctx.session.settings;
@@ -916,7 +953,7 @@ bot.command('wallet', async (ctx) => {
         message += `Created: ${new Date(wallet.created_at * 1000).toLocaleDateString()}\n\n`;
       } catch {
         message += `<b>${chain}</b>\n`;
-        message += `Address: <code>${shortAddress}</code>\n`;
+        message += `Address: <code>${address}</code>\n`;
         message += `Created: ${new Date(wallet.created_at * 1000).toLocaleDateString()}\n\n`;
       }
     }
@@ -1022,6 +1059,110 @@ bot.command('generate_wallet', async (ctx) => {
     }
   } catch (error: any) {
     await ctx.reply(`❌ Error: ${error.message}`);
+  }
+});
+
+
+// /check command
+bot.command('check', async (ctx) => {
+  const args = ctx.message?.text.split(' ').slice(1);
+  if (!args || args.length === 0) {
+    return ctx.reply('⚠️ Usage: /check <token_address>');
+  }
+
+  const token = args[0];
+  const chain = 'solana'; // Default for now
+
+  await ctx.reply(`🔍 <b>Analyzing Token...</b>\nScanning DexScreener & Blockchain...`, { parse_mode: 'HTML' });
+
+  try {
+    const result = await callRustAPI(`/api/check/${chain}/${token}`);
+    
+    if (result.error) {
+      return ctx.reply(`❌ Analysis failed: ${result.error}`);
+    }
+
+    // Format Score Emoji
+    let scoreEmoji = '🟢';
+    if (result.total_score < 70) scoreEmoji = '🟡';
+    if (result.total_score < 40) scoreEmoji = '🔴';
+
+    let message = `📊 <b>Token Analysis: ${result.symbol || 'Unknown'}</b>\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+    
+    message += `${scoreEmoji} <b>Score: ${result.total_score.toFixed(1)}/100</b>\n\n`;
+    
+    message += `💰 <b>Price:</b> $${result.price_usd}\n`;
+    message += `💧 <b>Liquidity:</b> $${formatNumber(result.liquidity_usd)}\n`;
+    message += `📈 <b>Volume (24h):</b> $${formatNumber(result.volume_24h)}\n`;
+    message += `📦 <b>FDV:</b> $${formatNumber(result.fdv)}\n`;
+    message += `⏳ <b>Age:</b> ${result.pair_age_hours.toFixed(1)} hours\n\n`;
+
+    // Bundler Section
+    if (result.bundler_details) {
+        const b = result.bundler_details;
+        message += `🕵️‍♂️ <b>Bundler Check:</b>\n`;
+        if (b.bundled_percentage > 30) {
+             message += `⚠️ <b>HIGH RISK: ${b.bundled_percentage.toFixed(1)}% supply bundled!</b>\n`;
+        } else {
+             message += `✅ <b>Safe:</b> Only ${b.bundled_percentage.toFixed(1)}% bundled.\n`;
+        }
+    } else {
+        message += `🕵️‍♂️ <b>Bundler Check:</b> N/A\n`;
+    }
+
+    // Risk Flags
+    if (result.risk_flags && result.risk_flags.length > 0) {
+        message += `\n🚩 <b>Risk Flags:</b>\n`;
+        for (const flag of result.risk_flags) {
+            message += `• ${flag}\n`;
+        }
+    }
+
+    message += `\n━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `<a href="https://dexscreener.com/solana/${token}">View on DexScreener</a>`;
+
+    await ctx.reply(message, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+
+  } catch (error: any) {
+    await ctx.reply(`❌ Error: ${error.message}`);
+  }
+});
+
+// /export_keys command
+bot.command('export_keys', async (ctx) => {
+  try {
+    await ctx.reply('🔐 <b>Exporting Private Keys...</b>', { parse_mode: 'HTML' });
+    
+    const wallets = await callRustAPI(`/api/wallet/export/${ctx.from!.id}`);
+    
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      return ctx.reply('❌ No wallets found to export.');
+    }
+    
+    let message = '⚠️ <b>SENSITIVE DATA WARNING</b> ⚠️\n\n';
+    message += 'Below are your Private Keys. Do NOT share these with anyone.\n';
+    message += 'Copy them immediately and delete this message.\n';
+    message += '━━━━━━━━━━━━━━━━━━━━\n\n';
+    
+    for (const w of wallets) {
+        // Infer chain from address format if not explicitly returned, 
+        // or just label them clearly. WalletResponse has address/privKey.
+        // We'll try to guess chain or just show generic.
+        // Actually, we should probably return chain in Export response, but WalletResponse doesn't have it explicitly as a top field 
+        // effectively, but let's just show Address -> Key.
+        
+        message += `📍 <b>Address:</b>\n<code>${w.address}</code>\n`;
+        message += `🔑 <b>Private Key:</b>\n<code>${w.private_key}</code>\n\n`;
+    }
+    
+    message += '━━━━━━━━━━━━━━━━━━━━\n';
+    message += '<i>These keys give full access to your funds. Handle with care.</i>';
+    
+    await ctx.reply(message, { parse_mode: 'HTML' });
+    
+  } catch (error: any) {
+    await ctx.reply(`❌ Error exporting keys: ${error.message}`);
   }
 });
 
@@ -2870,10 +3011,12 @@ bot.on('message:text', async (ctx) => {
              await ctx.reply(
                `⚠️ <b>Security Check Failed</b>\n\n` +
                `${errorMsg}\n\n` +
-               `To bypass this check, click below:`,
+               `To bypass this check, use:\n` +
+               `/force_buy ${tokenForButton} <amount>`,
                { 
                  parse_mode: 'HTML',
-                 reply_markup: new InlineKeyboard().text('⚠️ Force Buy', `force_buy:${tokenForButton}:${amount}`)
+                 // Cannot offer direct button as amount is unknown
+                 reply_markup: new InlineKeyboard().text('⚙️ Settings', 'settings')
                }
             );
             return;
@@ -4315,58 +4458,63 @@ bot.on('message:text', async (ctx) => {
   const loadingMsg = await ctx.reply('🔍 <b>Fetching token info...</b>', { parse_mode: 'HTML' });
   
   try {
-    // Fetch token info, price, and security check in parallel
-    const [priceData, securityData] = await Promise.allSettled([
-      callRustAPI(`/api/price/${settings.defaultChain}/${token}`).catch(() => null),
-      callRustAPI(`/api/security-check/${settings.defaultChain}/${token}`).catch(() => null)
-    ]);
-    
-    const price = priceData.status === 'fulfilled' ? priceData.value : null;
-    const security = securityData.status === 'fulfilled' ? securityData.value : null;
+
+    // Fetch comprehensive token analysis
+    const analysis = await callRustAPI(`/api/check/${settings.defaultChain}/${token}`).catch(() => null);
     
     // Get user's balance for this token
     const wallets = await callRustAPI(`/api/wallets/${ctx.from!.id}`).catch(() => []);
     const userWallet = wallets.find((w: any) => w.chain === settings.defaultChain);
     
-    // Build Trojan-style message
+    // Build Trojan-style message with Analysis
     let message = `<b>🪙 Token Info</b>\n\n`;
     
     // Token symbol and address
-    if (price?.symbol) {
-      message += `<b>Buy ${price.symbol}</b> 📊\n`;
+    if (analysis?.symbol) {
+      message += `<b>Buy ${analysis.symbol}</b> 📊\n`;
     }
     message += `<code>${token}</code>\n\n`;
     
     // Balance
-    message += `<b>Balance:</b> 0 SOL — W2 👍\n`;
+    message += `<b>Balance:</b> 0 SOL — W2 👍\n`; // TODO: Fetch real balance
     
     // Price info
-    if (price) {
-      message += `<b>Price:</b> $${formatNumber(price.price, 8)}\n`;
-      message += `<b>LIQ:</b> $${formatNumber(price.liquidity_usd / 1000, 2)}K — `;
-      message += `<b>MC:</b> $${formatNumber(price.market_cap / 1000, 2)}K\n`;
+    if (analysis) {
+      message += `<b>Price:</b> $${formatNumber(analysis.price_usd, 8)}\n`;
+      message += `<b>LIQ:</b> $${formatNumber(analysis.liquidity_usd / 1000, 2)}K — `;
+      message += `<b>MC:</b> $${formatNumber(analysis.market_cap / 1000, 2)}K\n`;
+      message += `<b>FDV:</b> $${formatNumber(analysis.fdv / 1000, 2)}K — `;
+      message += `<b>Age:</b> ${analysis.pair_age_hours.toFixed(1)}h\n\n`;
+
+      // SCORE & BUNDLER SECTION (New)
+      let scoreEmoji = '🟢';
+      if (analysis.total_score < 70) scoreEmoji = '🟡';
+      if (analysis.total_score < 40) scoreEmoji = '🔴';
+      
+      message += `${scoreEmoji} <b>Score: ${analysis.total_score.toFixed(1)}/100</b>\n`;
+      
+      if (analysis.bundler_details) {
+          const b = analysis.bundler_details;
+          if (b.bundled_percentage > 30) {
+             message += `⚠️ <b>BUNDLER WARNING: ${b.bundled_percentage.toFixed(1)}% Bundled!</b>\n`;
+          } else {
+             message += `✅ <b>Bundler Safe (${b.bundled_percentage.toFixed(1)}%)</b>\n`;
+          }
+      }
+      message += `\n`;
     } else {
       message += `<b>Price:</b> Not available\n`;
-      message += `<b>LIQ:</b> Unknown — <b>MC:</b> Unknown\n`;
-    }
-    
-    // Security status
-    if (security) {
-      if (security.is_safe) {
-        message += `<b>Renounced</b> ✅\n\n`;
-      } else {
-        message += `<b>⚠️ Risk Detected</b>\n\n`;
-      }
-    } else {
-      message += `\n`;
+      message += `<b>LIQ:</b> Unknown — <b>MC:</b> Unknown\n\n`;
     }
     
     // Price impact calculator (example with 0.1 SOL)
     const exampleAmount = 0.1;
-    if (price) {
-      const tokens = (exampleAmount / price.price);
-      const impact = calculatePriceImpact(exampleAmount, price.liquidity_usd);
-      message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${price.symbol || 'tokens'} ($${formatNumber(exampleAmount * price.price, 2)})\n`;
+    if (analysis) {
+      const tokens = (exampleAmount / (analysis.price_usd / 140)); // Approx SOL price $140 for calc
+      // Simple impact estimation
+      const impact = (exampleAmount * 140) / (analysis.liquidity_usd) * 100; 
+      
+      message += `<b>${exampleAmount} SOL</b> ⇄ ${formatNumber(tokens, 0)} ${analysis.symbol || 'tokens'} ($${formatNumber(exampleAmount * 140, 2)})\n`;
       message += `<b>Price Impact:</b> ${impact.toFixed(2)}%\n`;
     }
     

@@ -56,3 +56,5 @@ base64 = "0.21"
 sha3 = "0.10"  # For Keccak256 (Ethereum addresses)
 pbkdf2 = "0.12"
 bip39 = { version = "2.0", features = ["rand"] }  # BIP39 mnemonic generation
+bincode = "1.3.3"
+magic-crypt = "4.0.1"

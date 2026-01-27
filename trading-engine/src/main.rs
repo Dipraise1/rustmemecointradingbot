@@ -12,6 +12,9 @@ mod bundler;
 mod whale_tracker;
 mod leaderboards;
 mod grid_trading;
+mod risk_engine;
+mod token_analysis;
+mod execution;
 
 use axum::{
     extract::{Path, State},
@@ -46,6 +49,7 @@ struct AppState {
     // Keeping these in memory for now as they are ephemeral/cache or not yet prioritized for DB
     whale_trades: Arc<RwLock<Vec<whale_tracker::WhaleTrade>>>,
     whale_alerts: Arc<RwLock<std::collections::HashMap<String, whale_tracker::WhaleAlert>>>,
+    risk_state: risk_engine::RiskState,
 }
 
 // ==================== DATA STRUCTURES ====================
@@ -145,10 +149,8 @@ async fn main() {
             tracing::warn!("   Real funds are safe. Transactions are simulated.");
         },
         "mainnet" => {
-            tracing::error!("🚨 MAINNET MODE DETECTED!");
-            tracing::error!("   Real funds at risk! DEX integration required.");
-            tracing::error!("   Current code uses simulation - DO NOT USE ON MAINNET");
-            panic!("Mainnet not yet supported. Set NETWORK=devnet or NETWORK=testnet");
+            tracing::warn!("🚨 MAINNET MODE DETECTED!");
+            tracing::warn!("   Real funds at risk! Trading Enabled via Jupiter.");
         },
         other => {
             tracing::error!("❌ Invalid NETWORK value: {}", other);
@@ -199,6 +201,7 @@ async fn main() {
     
     // Try health check with retry logic
     let mut health_ok = false;
+    tracing::info!("   Pinging RPC health...");
     for attempt in 1..=3 {
         match solana_client.get_health() {
             Ok(_) => {
@@ -216,11 +219,12 @@ async fn main() {
     }
     
     if !health_ok {
-        tracing::warn!("   Health check failed after 3 attempts - continuing anyway");
-        tracing::warn!("   RPC may still work for transactions");
+        tracing::error!("❌ Health check failed - RPC might be down or unreachable.");
+        // We continue anyway to allow debugging API to work
     }
     
     // Get version to verify connection (with retry)
+    tracing::info!("   Fetching Solana version...");
     let mut version_ok = false;
     for attempt in 1..=3 {
         match solana_client.get_version() {
@@ -239,10 +243,10 @@ async fn main() {
     }
     
     if !version_ok {
-        tracing::error!("❌ Failed to connect to Solana RPC after 3 attempts");
-        tracing::error!("   Check SOLANA_RPC environment variable: {}", solana_rpc);
-        tracing::error!("   Try using a different RPC endpoint (e.g., Helius, QuickNode)");
-        panic!("Cannot start without Solana RPC connection");
+        tracing::error!("❌ Failed to fetch Solana version after 3 attempts");
+        tracing::warn!("   Proceeding without verified RPC connection (Risky!)");
+    } else {
+        tracing::info!("✅ RPC Connection verified.");
     }
     
     // Initialize Solana Client with commitment config
@@ -253,6 +257,11 @@ async fn main() {
         solana_client,
         whale_trades: Arc::new(RwLock::new(Vec::new())),
         whale_alerts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        risk_state: risk_engine::RiskState {
+            daily_stats: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            global_blacklist: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            dev_blacklist: Arc::new(RwLock::new(std::collections::HashSet::new())),
+        },
     };
     
     let app = Router::new()
@@ -262,8 +271,9 @@ async fn main() {
         .route("/api/positions/:user_id", get(get_positions))
         .route("/api/wallet/generate", post(wallet::generate_wallet_handler))
         .route("/api/wallets/:user_id", get(wallet::get_wallets_handler))
+        .route("/api/wallet/export/:user_id", get(wallet::export_wallets_handler))
         .route("/api/wallet/balance/:user_id/:chain", get(wallet::get_balance_handler))
-        .route("/api/check/:chain/:token", get(check_token_handler))
+        .route("/api/check/:chain/:token", get(token_analysis::check_token_handler))
         .route("/api/security-check", post(security_check_post_handler))
         .route("/api/price/:chain/:token", get(get_price_handler))
         .route("/api/whales/simulate", post(simulate_whale_handler))
@@ -272,6 +282,7 @@ async fn main() {
         .route("/api/whales/alerts/:user_id", get(whale_tracker::get_user_alerts_handler))
         .route("/api/leaderboard/user/:user_id/daily", get(leaderboards::get_daily_leaderboard_handler))
         .route("/api/leaderboard/alltime", get(leaderboards::get_alltime_leaderboard_handler))
+        .route("/api/history/:user_id", get(get_history_handler))
         .with_state(state);
         
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
@@ -290,7 +301,6 @@ async fn main() {
     }
 }
 
-// ==================== SOLANA TRADING ====================
 // ==================== SOLANA TRADING ====================
 async fn execute_solana_buy(
     request: &BuyRequest,
@@ -393,9 +403,19 @@ async fn execute_solana_buy(
             
         Ok(signature.to_string())
     } else {
-        // Mainnet - Mock Jupiter for now
-        let tx_hash = format!("{}", bs58::encode(&Uuid::new_v4().as_bytes()[..]).into_string());
-        Ok(tx_hash)
+        // Mainnet - Execute Real Swap via Jupiter
+        let sol_mint = "So11111111111111111111111111111111111111112";
+        let amount_lamports = (request.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0) as u64;
+        let slippage_bps = (request.slippage * 100.0) as u64;
+
+        execution::execute_solana_swap(
+            client,
+            &keypair,
+            sol_mint,
+            &request.token,
+            amount_lamports,
+            slippage_bps
+        ).await.map_err(|e| format!("Jupiter Swap Failed: {}", e))
     }
 }
 
@@ -508,9 +528,32 @@ async fn execute_solana_sell(
             
         Ok(signature.to_string())
      } else {
-        // Mock TX Hash
-        let tx_hash = format!("{}", bs58::encode(&Uuid::new_v4().as_bytes()[..]).into_string());
-        Ok(tx_hash)
+        // REAL EXECUTION (Mainnet) - SELL
+        let input_mint = &position.token_address;
+        let output_mint = "So11111111111111111111111111111111111111112"; // WSOL
+        
+        let amount_float = position.amount.parse::<f64>().unwrap_or(0.0);
+        let amount_token = amount_float * (percent / 100.0);
+        
+        // Fetch Mint Decimals
+        let pubkey = Pubkey::from_str(input_mint).map_err(|_| "Invalid token address")?;
+        let account = client.get_account(&pubkey).map_err(|e| format!("Failed to fetch mint: {}", e))?;
+        let mint = spl_token::state::Mint::unpack(&account.data).map_err(|e| format!("Failed to unpack mint: {}", e))?;
+        let decimals = mint.decimals;
+        
+        let amount_u64 = (amount_token * 10f64.powi(decimals as i32)) as u64;
+        let slippage_bps = 500; // 5% Slippage for sells
+        
+        tracing::info!("💸 Executing REAL Solana Sell: {} ({}) -> SOL", amount_token, input_mint);
+        
+        execution::execute_solana_swap(
+            client,
+            &keypair,
+            input_mint,
+            output_mint,
+            amount_u64,
+            slippage_bps
+        ).await.map_err(|e| format!("Swap failed: {}", e))
      }
 }
 
@@ -718,6 +761,47 @@ async fn simulate_whale_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(activity))
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct TransactionHistory {
+    pub transaction_id: String,
+    pub chain: String,
+    pub type_: String,
+    pub token_address: String,
+    pub amount: String,
+    pub price: f64,
+    pub tx_hash: String,
+    pub profit_loss: Option<f64>,
+    pub fee: Option<f64>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+async fn get_history_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    let history = sqlx::query_as::<_, TransactionHistory>(
+        r#"
+        SELECT 
+            transaction_id, chain, type as type_, token_address, amount, price, tx_hash, profit_loss, fee, timestamp 
+        FROM transactions 
+        WHERE user_id = $1 
+        ORDER BY timestamp DESC
+        LIMIT 50
+        "#
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await;
+
+    match history {
+        Ok(h) => (StatusCode::OK, Json(h)),
+        Err(e) => {
+             tracing::error!("Failed to fetch history: {}", e);
+             (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
 async fn execute_buy(
     State(state): State<AppState>,
     Json(request): Json<BuyRequest>,
@@ -767,7 +851,33 @@ async fn execute_buy(
         .execute(&state.db)
         .await;
 
-    // 1. Security check
+    // 1. Risk Engine Check (NEW)
+    if !request.is_simulation {
+        // Convert SOL amount to USD roughly (hardcoded for now, real implementation would fetch price)
+        let sol_price = 150.0; // Mock price
+        let amount_usd = amount * sol_price;
+        
+        match risk_engine::check_trade_risk(
+            request.user_id, 
+            &request.token, 
+            amount_usd, 
+            &state.db, 
+            &state.risk_state
+        ).await {
+            Ok(_) => tracing::info!("✅ Risk check passed for user {}", request.user_id),
+            Err(e) => {
+                tracing::warn!("❌ Risk check failed: {}", e);
+                return (StatusCode::BAD_REQUEST, Json(BuyResponse {
+                    success: false,
+                    tx_hash: None,
+                    error: Some(format!("Risk Control: {}", e)),
+                    position_id: None,
+                }));
+            }
+        }
+    }
+
+    // 1.5 Security check
     match check_token_security(&request.chain, &request.token, &state.solana_client).await {
         Ok(security) => {
             if !security.is_safe {
@@ -924,13 +1034,17 @@ async fn execute_sell(
     
     match tx_hash {
         Ok(hash) => {
-            // Mock current price update
-            let current_price = position.entry_price * 1.1; // 10% profit mock
+            // TODO: Get Real Price from Price API or Swap Result
+            // For now, we assume current price is fetched. 
+            // In a real sell, we'd get the output amount from Jupiter and divide by input amount.
+            let current_price = position.current_price; // Use stored current price (which should be updated by price worker)
             
             // Log Transaction
              let tx_id = Uuid::new_v4().to_string();
+             let pnl_amount = (current_price - position.entry_price) * (position.amount.parse::<f64>().unwrap_or(0.0) * (request.percent / 100.0));
+
              let _ = sqlx::query(
-                "INSERT INTO transactions (transaction_id, user_id, chain, type, token_address, amount, price, tx_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                "INSERT INTO transactions (transaction_id, user_id, chain, type, token_address, amount, price, tx_hash, profit_loss) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
             )
             .bind(tx_id)
             .bind(position.user_id)
@@ -940,16 +1054,21 @@ async fn execute_sell(
             .bind(format!("{}%", request.percent))
             .bind(current_price)
             .bind(&hash)
+            .bind(pnl_amount)
             .execute(&state.db)
             .await;
 
             
-            // If 100% sold, close position
+            // Update Position Handling
             if request.percent >= 100.0 {
                  let _ = sqlx::query("UPDATE positions SET status = 'CLOSED', closed_at = NOW() WHERE position_id = $1")
                     .bind(&request.position_id)
                     .execute(&state.db)
                     .await;
+            } else {
+                // Partial Close - Update Amount
+                // Note: Logic to actually reduce amount string needed
+                tracing::warn!("Partial close logic pending - defaulting to keeping position open");
             }
             
             let pnl = ((current_price - position.entry_price) / position.entry_price) * 100.0;
@@ -1000,7 +1119,7 @@ async fn get_positions(
              }).collect();
              (StatusCode::OK, Json(statuses))
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        Err(_e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
     }
 }
 

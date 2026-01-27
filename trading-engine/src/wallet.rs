@@ -11,8 +11,18 @@ use hex;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use sha3::{Keccak256, Digest};
-use chrono::Utc;
+use magic_crypt::MagicCryptTrait;
+use std::env;
 use bip39::{Mnemonic, Language};
+
+const DEFAULT_MASTER_KEY: &str = "change_me_in_production_please_12345678"; // Fallback only for ease of dev, warn in prod
+
+fn get_master_key() -> String {
+    env::var("MASTER_ENCRYPTION_KEY").unwrap_or_else(|_| {
+        tracing::warn!("⚠️  MASTER_ENCRYPTION_KEY not set. Using insecure default!");
+        DEFAULT_MASTER_KEY.to_string()
+    })
+}
 
 // ==================== WALLET STRUCTURES ====================
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -62,35 +72,18 @@ pub struct ImportDataResponse {
     pub errors: Vec<String>,
 }
 
-// ==================== ENCRYPTION ====================
-pub fn encrypt_key(key: &str, user_id: i64) -> String {
-    let key_bytes = key.as_bytes();
-    let user_id_str = user_id.to_string();
-    let user_bytes = user_id_str.as_bytes();
-    let mut encrypted = Vec::new();
-    
-    for (i, byte) in key_bytes.iter().enumerate() {
-        let xor_byte = byte ^ user_bytes[i % user_bytes.len()];
-        encrypted.push(xor_byte);
-    }
-    
-    STANDARD.encode(&encrypted)
+// ==================== ENCRYPTION (AES-256) ====================
+pub fn encrypt_key(key: &str, _user_id: i64) -> String {
+    let master_key = get_master_key();
+    let mc = magic_crypt::new_magic_crypt!(master_key, 256);
+    mc.encrypt_str_to_base64(key)
 }
 
-pub fn decrypt_key(encrypted: &str, user_id: i64) -> Result<String, String> {
-    let encrypted_bytes = STANDARD.decode(encrypted)
-        .map_err(|e| format!("Decode error: {}", e))?;
-    let user_id_str = user_id.to_string();
-    let user_bytes = user_id_str.as_bytes();
-    let mut decrypted = Vec::new();
-    
-    for (i, byte) in encrypted_bytes.iter().enumerate() {
-        let xor_byte = byte ^ user_bytes[i % user_bytes.len()];
-        decrypted.push(xor_byte);
-    }
-    
-    String::from_utf8(decrypted)
-        .map_err(|e| format!("UTF-8 error: {}", e))
+pub fn decrypt_key(encrypted: &str, _user_id: i64) -> Result<String, String> {
+    let master_key = get_master_key();
+    let mc = magic_crypt::new_magic_crypt!(master_key, 256);
+    mc.decrypt_base64_to_string(encrypted)
+        .map_err(|e| format!("Decryption failed: {}", e))
 }
 
 // ==================== SOLANA WALLETS ====================
@@ -325,6 +318,40 @@ pub async fn get_wallets_handler(
         Ok(ws) => (StatusCode::OK, Json(ws)),
         Err(e) => {
             tracing::error!("Failed to fetch wallets: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+pub async fn export_wallets_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    let wallets = sqlx::query_as::<_, WalletInfo>(
+        "SELECT * FROM wallets WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await;
+
+    match wallets {
+        Ok(ws) => {
+            let mut exported_wallets = Vec::new();
+            for w in ws {
+                if let Ok(decrypted_key) = decrypt_key(&w.encrypted_private_key, user_id) {
+                    exported_wallets.push(WalletResponse {
+                        success: true,
+                        address: Some(w.address),
+                        private_key: Some(decrypted_key),
+                        mnemonic: None, // We don't store mnemonic after verify
+                        error: None,
+                    });
+                }
+            }
+            (StatusCode::OK, Json(exported_wallets))
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch wallets for export: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
         }
     }
