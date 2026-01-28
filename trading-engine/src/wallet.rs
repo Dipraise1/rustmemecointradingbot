@@ -30,9 +30,12 @@ pub struct WalletInfo {
     pub user_id: i64,
     pub chain: String,
     pub address: String,
+    #[sqlx(rename = "private_key")]
     pub encrypted_private_key: String,
-    pub created_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(default)]
     pub balance: Option<String>,
+    #[sqlx(default)]
     pub last_updated: Option<i64>,
 }
 
@@ -80,10 +83,29 @@ pub fn encrypt_key(key: &str, _user_id: i64) -> String {
 }
 
 pub fn decrypt_key(encrypted: &str, _user_id: i64) -> Result<String, String> {
+    // Trim whitespace that might have been introduced during storage/retrieval
+    let encrypted = encrypted.trim();
+    
+    // Validate that it looks like base64 (basic check)
+    if encrypted.is_empty() {
+        return Err("Decryption failed: Empty encrypted data".to_string());
+    }
+    
     let master_key = get_master_key();
     let mc = magic_crypt::new_magic_crypt!(master_key, 256);
+    
     mc.decrypt_base64_to_string(encrypted)
-        .map_err(|e| format!("Decryption failed: {}", e))
+        .map_err(|e| {
+            // Provide more helpful error messages
+            let error_msg = e.to_string();
+            if error_msg.contains("Unpad") || error_msg.contains("padding") {
+                format!("Decryption failed: Invalid padding (encrypted data may be corrupted or encrypted with different key). Error: {}", error_msg)
+            } else if error_msg.contains("base64") {
+                format!("Decryption failed: Invalid base64 encoding. Error: {}", error_msg)
+            } else {
+                format!("Decryption failed: {}. This may indicate the MASTER_ENCRYPTION_KEY has changed or the encrypted data is corrupted.", error_msg)
+            }
+        })
 }
 
 // ==================== SOLANA WALLETS ====================
@@ -297,18 +319,7 @@ pub async fn get_wallets_handler(
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
     let wallets = sqlx::query_as::<_, WalletInfo>(
-        r#"
-        SELECT 
-            user_id, 
-            chain, 
-            address, 
-            private_key as encrypted_private_key, 
-            EXTRACT(EPOCH FROM created_at)::BIGINT as created_at,
-            NULL::text as balance, 
-            NULL::bigint as last_updated 
-        FROM wallets 
-        WHERE user_id = $1
-        "#
+        "SELECT user_id, chain, address, private_key, created_at FROM wallets WHERE user_id = $1"
     )
     .bind(user_id)
     .fetch_all(&state.db)
@@ -317,7 +328,7 @@ pub async fn get_wallets_handler(
     match wallets {
         Ok(ws) => (StatusCode::OK, Json(ws)),
         Err(e) => {
-            tracing::error!("Failed to fetch wallets: {}", e);
+            tracing::error!("Failed to fetch wallets for user {}: {}", user_id, e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
         }
     }
@@ -328,7 +339,7 @@ pub async fn export_wallets_handler(
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
     let wallets = sqlx::query_as::<_, WalletInfo>(
-        "SELECT * FROM wallets WHERE user_id = $1"
+        "SELECT user_id, chain, address, private_key, created_at FROM wallets WHERE user_id = $1"
     )
     .bind(user_id)
     .fetch_all(&state.db)
@@ -343,7 +354,7 @@ pub async fn export_wallets_handler(
                         success: true,
                         address: Some(w.address),
                         private_key: Some(decrypted_key),
-                        mnemonic: None, // We don't store mnemonic after verify
+                        mnemonic: None,
                         error: None,
                     });
                 }
@@ -351,7 +362,7 @@ pub async fn export_wallets_handler(
             (StatusCode::OK, Json(exported_wallets))
         }
         Err(e) => {
-            tracing::error!("Failed to fetch wallets for export: {}", e);
+            tracing::error!("Failed to fetch wallets for export for user {}: {}", user_id, e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
         }
     }
@@ -378,8 +389,15 @@ pub async fn get_wallet_keypair(
 
     let record = record.ok_or("Wallet not found")?;
 
-    // 2. Decrypt key
-    let private_key_str = decrypt_key(&record.private_key, user_id)?;
+    // 2. Decrypt key (with debug info)
+    tracing::debug!("Attempting to decrypt wallet for user {} on chain {}", user_id, chain);
+    let private_key_str = decrypt_key(&record.private_key, user_id)
+        .map_err(|e| {
+            tracing::error!("Wallet decryption failed for user {} on chain {}: {}", user_id, chain, e);
+            tracing::error!("Encrypted data length: {} bytes", record.private_key.len());
+            tracing::error!("Encrypted data preview: {}...", &record.private_key.chars().take(20).collect::<String>());
+            e
+        })?;
 
     // 3. Create Keypair (Solana only for now)
     if chain == "solana" || chain == "sol" {

@@ -2,6 +2,7 @@
 name = "trading-engine"
 version = "0.1.0"
 edition = "2021"
+default-run = "trading-engine"
 
 [dependencies]
 # Web Server
@@ -23,6 +24,7 @@ sqlx = { version = "0.6", features = ["runtime-tokio-rustls", "postgres", "macro
 solana-sdk = "1.18"
 solana-client = "1.18"
 spl-token = "4.0"
+spl-token-2022 = "0.8"
 
 # EVM - Using secp256k1 directly (compatible with Solana)
 secp256k1 = { version = "0.23", features = ["rand"] }

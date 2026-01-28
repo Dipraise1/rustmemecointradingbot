@@ -28,7 +28,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 use solana_sdk::program_pack::Pack; // For unpacking Mint data
-use spl_token::state::Mint;         // For Mint struct
+use spl_token::state::Mint;         // For Mint struct (SPL Token)
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::{
     str::FromStr,
@@ -40,6 +40,39 @@ use uuid::Uuid;
 use wallet::*;
 use bs58;
 use hex;
+
+// ==================== TOKEN PROGRAM IDS ====================
+// Token-2022 Program ID (newer token standard)
+lazy_static::lazy_static! {
+    static ref TOKEN_2022_PROGRAM_ID: Pubkey = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        .expect("Invalid Token-2022 program ID");
+}
+
+// Helper function to check if account is owned by a valid token program
+fn is_valid_token_program(owner: &Pubkey) -> bool {
+    owner == &spl_token::id() || owner == &*TOKEN_2022_PROGRAM_ID
+}
+
+// Helper function to unpack base Mint data (works for both legacy SPL and Token-2022)
+// Returns (decimals, supply, mint_authority, freeze_authority)
+// Note: Always unpacks only the first 82 bytes (base Mint layout) to avoid issues with
+// malformed Token-2022 extension data, which is common in many memecoins.
+fn unpack_mint_data(account_data: &[u8], _owner: &Pubkey) -> Result<(u8, u64, Option<Pubkey>, Option<Pubkey>), String> {
+    if account_data.len() < spl_token::state::Mint::LEN {
+        return Err("Mint account data too short (< 82 bytes) - invalid token".to_string());
+    }
+
+    // Always unpack the first 82 bytes as base Mint (layout is compatible between SPL Token and Token-2022)
+    let base_mint = spl_token::state::Mint::unpack(&account_data[..spl_token::state::Mint::LEN])
+        .map_err(|e| format!("Failed to unpack base mint data: {}", e))?;
+
+    Ok((
+        base_mint.decimals,
+        base_mint.supply,
+        base_mint.mint_authority.into(),
+        base_mint.freeze_authority.into(),
+    ))
+}
 
 // ==================== SHARED STATE ====================
 #[derive(Clone)]
@@ -538,8 +571,15 @@ async fn execute_solana_sell(
         // Fetch Mint Decimals
         let pubkey = Pubkey::from_str(input_mint).map_err(|_| "Invalid token address")?;
         let account = client.get_account(&pubkey).map_err(|e| format!("Failed to fetch mint: {}", e))?;
-        let mint = spl_token::state::Mint::unpack(&account.data).map_err(|e| format!("Failed to unpack mint: {}", e))?;
-        let decimals = mint.decimals;
+        
+        // Verify account is owned by SPL Token or Token-2022 Program before unpacking
+        if !is_valid_token_program(&account.owner) {
+            return Err(format!("Account is not a valid SPL Token Mint. Owner: {} (expected: SPL Token or Token-2022)", account.owner));
+        }
+        
+        // Unpack mint data (handles both SPL Token and Token-2022)
+        let (decimals, _, _, _) = unpack_mint_data(&account.data, &account.owner)
+            .map_err(|e| format!("Failed to unpack mint: {}", e))?;
         
         let amount_u64 = (amount_token * 10f64.powi(decimals as i32)) as u64;
         let slippage_bps = 500; // 5% Slippage for sells
@@ -611,34 +651,47 @@ async fn check_token_security(
             format!("Failed to fetch account: {}: pubkey={}", e, pubkey)
         })?;
 
-    // 2. Unpack Mint Data
-    let mint = Mint::unpack(&account.data)
+    // 2. Verify account is owned by SPL Token or Token-2022 Program before unpacking
+    if !is_valid_token_program(&account.owner) {
+        return Err(format!("Account is not a valid SPL Token Mint. Owner: {} (expected: SPL Token or Token-2022)", account.owner));
+    }
+
+    // 3. Unpack Mint Data (handles both SPL Token and Token-2022)
+    let (decimals, supply, mint_authority, freeze_authority) = unpack_mint_data(&account.data, &account.owner)
         .map_err(|e| format!("Failed to unpack Mint data: {}", e))?;
 
     let mut score = 100;
     let mut warnings = Vec::new();
     let mut is_safe = true;
 
-    // 3. Check Authorities
-    if mint.mint_authority.is_some() {
+    // 3.5. Check for Token-2022 with extensions (may have hidden fees, permanent delegate, etc.)
+    let data_len = account.data.len();
+    if account.owner == *TOKEN_2022_PROGRAM_ID {
+        if data_len > spl_token::state::Mint::LEN {
+            warnings.push("Token-2022 with extensions (may have hidden transfer fees, permanent delegate, etc.)".to_string());
+            score -= 15; // Penalize slightly until specific extensions are parsed
+        }
+    }
+
+    // 4. Check Authorities
+    if mint_authority.is_some() {
         score -= 30;
         warnings.push("Mint Authority is still active (Supply can change)".to_string());
     } else {
         // Renounced mint auth is a green flag
     }
 
-    if mint.freeze_authority.is_some() {
+    if freeze_authority.is_some() {
         score -= 50;
         warnings.push("Freeze Authority is ENABLED (Dev can freeze wallet)".to_string());
         is_safe = false; // Freeze auth is considered instant-unsafe by many
     }
 
-    // 4. Check Holders (Top 20)
+    // 5. Check Holders (Top 20)
     let largest_accounts = client.get_token_largest_accounts(&pubkey)
         .map_err(|e| format!("Failed to get largest accounts: {}", e))?;
     
     // Calculate total supply (raw)
-    let supply = mint.supply;
     let mut top_10_percent = 0.0;
     
     // Simple calc: sum top 10 balances / total supply
@@ -997,15 +1050,25 @@ async fn execute_buy(
                 }),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(BuyResponse {
-                success: false,
-                tx_hash: None,
-                error: Some(e),
-                position_id: None,
-            }),
-        ),
+        Err(e) => {
+            let status = if e.contains("Insufficient balance") 
+                || e.contains("Risk Control") 
+                || e.contains("Token Risk") 
+                || e.contains("Invalid") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(BuyResponse {
+                    success: false,
+                    tx_hash: None,
+                    error: Some(e),
+                    position_id: None,
+                }),
+            )
+        }
     }
 }
 
@@ -1129,7 +1192,7 @@ async fn get_portfolio_handler(
 ) -> impl IntoResponse {
     // 1. Fetch Wallets
     let wallets_result = sqlx::query_as::<_, wallet::WalletInfo>(
-        "SELECT user_id, chain, address, private_key as encrypted_private_key, EXTRACT(EPOCH FROM created_at)::BIGINT as created_at, NULL::text as balance, NULL::bigint as last_updated FROM wallets WHERE user_id = $1"
+        "SELECT user_id, chain, address, private_key, created_at FROM wallets WHERE user_id = $1"
     )
     .bind(user_id)
     .fetch_all(&state.db)

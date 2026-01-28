@@ -138,6 +138,45 @@ bot.callbackQuery('portfolio', async (ctx) => {
 
 
 
+// Helper to format and display buy errors
+async function handleBuyError(ctx: MyContext, e: any, token?: string, amount?: string) {
+    if (e.message.includes('Token Risk') || (e.message.includes('API error') && e.message.includes('Token Risk'))) {
+         const errorMatch = e.message.match(/error":"([^"]+)"/);
+         const cleanError = errorMatch ? errorMatch[1] : e.message;
+         
+         const keyboard = new InlineKeyboard()
+           .text('⚙️ Settings', 'settings');
+           
+         if (token && amount) {
+             keyboard.text('⚠️ Force Buy', `force_buy:${token}:${amount}`).row();
+         }
+
+         await ctx.reply(
+           `⚠️ <b>Security Alert</b>\n\n` +
+           `The token security check failed: <i>${cleanError}</i>\n\n` +
+           `To buy anyway, use the <b>Force Buy</b> option or disable security checks in settings.`,
+           { 
+             parse_mode: 'HTML',
+             reply_markup: keyboard
+           }
+        );
+        return;
+    }
+    
+    if (e.message.includes('Insufficient balance')) {
+        const errorMatch = e.message.match(/error":"([^"]+)"/);
+        const cleanError = errorMatch ? errorMatch[1] : e.message;
+        return ctx.reply(
+            `❌ <b>Insufficient Balance</b>\n\n` +
+            `💰 ${cleanError}\n\n` +
+            `Please deposit more funds to your wallet to proceed.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+    
+    await ctx.reply(`❌ Error: ${e.message}`);
+}
+
 // ==================== COMMANDS ====================
 
 // Chat-based Buy/Sell/Swap Handler
@@ -201,24 +240,7 @@ bot.on('message:text', async (ctx, next) => {
       }
         }
     } catch (e: any) {
-        if (e.message.includes('Token Risk') || (e.message.includes('API error') && e.message.includes('Token Risk'))) {
-             // Try to extract clean error message
-             const match = e.message.match(/API error \(\d+\): (.*)/);
-             let errorMsg = match ? match[1] : e.message;
-             try { const json = JSON.parse(errorMsg); if(json.error) errorMsg = json.error; } catch(err){}
-             
-             await ctx.reply(
-               `⚠️ <b>Security Check Failed</b>\n\n` +
-               `${errorMsg}\n\n` +
-               `To bypass, enable "Ignore Safety" in /settings`,
-               { 
-                 parse_mode: 'HTML',
-                 reply_markup: new InlineKeyboard().text('⚙️ Settings', 'settings')
-               }
-            );
-            return;
-        }
-        await ctx.reply(`❌ Error: ${e.message}`);
+        await handleBuyError(ctx, e, token, amountStr);
     }
     return;
   }
@@ -597,7 +619,7 @@ bot.command('buy', async (ctx) => {
       }
     }
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error, token, amount.toString());
   }
 });
 
@@ -728,7 +750,7 @@ bot.command('positions', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -765,7 +787,7 @@ bot.command('history', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -965,7 +987,7 @@ bot.command('wallet', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -1058,7 +1080,7 @@ bot.command('generate_wallet', async (ctx) => {
       await ctx.reply(`❌ Error: ${result.error}`);
     }
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -1125,7 +1147,7 @@ bot.command('check', async (ctx) => {
     await ctx.reply(message, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
 
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -1217,7 +1239,7 @@ bot.command('import_wallet', async (ctx) => {
       await ctx.reply(`❌ Error: ${result.error}`);
     }
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -2308,48 +2330,85 @@ bot.callbackQuery('view_private_keys', async (ctx) => {
   }
 });
 
-// Show private key for specific chain
+// Show private key for specific chain - ADD CONFIRMATION STEP
 bot.callbackQuery(/^show_key_(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
+  const chain = ctx.match[1];
+  
+  const keyboard = new InlineKeyboard()
+    .text('✅ Yes, Show My Key', `confirm_show_key_${chain}`).row()
+    .text('❌ Cancel', `wallet_options_${chain}`);
 
+  await ctx.editMessageText(
+    `🔐 <b>Confirm View Private Key</b>\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Chain: <b>${chain.toUpperCase()}</b>\n\n` +
+    `⚠️ <b>SECURITY WARNING</b>\n\n` +
+    `Are you sure you want to view your private key? Anyone with this key can access your funds.\n\n` +
+    `• Make sure <b>nobody</b> is looking at your screen.\n` +
+    `• Do not take screenshots.\n` +
+    `• Delete the key message as soon as you are done copying it.`,
+    { parse_mode: 'HTML', reply_markup: keyboard }
+  );
+});
+
+// Confirm show private key
+bot.callbackQuery(/^confirm_show_key_(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery('🔐 Fetching key...');
   const chain = ctx.match[1];
 
   try {
-    const wallets = await callRustAPI(`/api/wallets/${ctx.from!.id}`);
-    const wallet = wallets.find((w: any) => w.chain === chain);
+    const wallets = await callRustAPI(`/api/wallet/export/${ctx.from!.id}`);
+    const wallet = Array.isArray(wallets) ? wallets.find((w: any) => w.address && (
+        // Match by chain or by address if we can't determine chain easily from export
+        // The export endpoint should ideally return chain too.
+        // Let's assume it returns all for the user and we match.
+        // Actually, we'll just check if it's the right one.
+        true 
+    )) : null;
 
-    if (!wallet) {
-      return ctx.editMessageText('❌ Wallet not found.', { parse_mode: 'HTML' });
+    // Better way: Find the wallet for this chain first to get the address
+    const userWallets = await callRustAPI(`/api/wallets/${ctx.from!.id}`);
+    const targetWallet = userWallets.find((w: any) => w.chain === chain);
+    
+    if (!targetWallet) {
+        return ctx.editMessageText('❌ Wallet not found.');
     }
 
-    // Try to get decrypted private key from API
-    // Note: In production, you'd add a secure endpoint that decrypts the key
-    // For now, we'll show a message that the key should have been saved when generated
+    // Now find the exported key that matches this address
+    const exportedWallet = Array.isArray(wallets) ? wallets.find((w: any) => w.address === targetWallet.address) : null;
+
+    if (!exportedWallet || !exportedWallet.private_key) {
+      return ctx.editMessageText('❌ Failed to retrieve private key. Make sure your wallet is properly setup.');
+    }
+
+    const message = `🔑 <b>Private Key - ${chain.toUpperCase()}</b>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `📍 <b>Address:</b>\n<code>${targetWallet.address}</code>\n\n` +
+      `🔑 <b>Private Key:</b>\n<code>${exportedWallet.private_key}</code>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `⚠️ <b>SECURITY REMINDER</b>\n\n` +
+      `• Copy the key and store it safely.\n` +
+      `• <b>DELETE THIS MESSAGE NOW</b> for your security.\n` +
+      `• Never share this key with anyone.`;
 
     const keyboard = new InlineKeyboard()
-      .text('🔙 Back', 'view_private_keys');
+      .text('🗑️ DELETE THIS MESSAGE', 'delete_this').row()
+      .text('🔙 Back', `wallet_options_${chain}`);
 
-    await ctx.editMessageText(
-      `🔑 <b>Private Key - ${chain.toUpperCase()}</b>\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `📍 <b>Address:</b>\n<code>${wallet.address}</code>\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `⚠️ <b>Private Key Access</b>\n\n` +
-      `Your private keys are encrypted and stored securely.\n\n` +
-      `💡 <b>Important:</b>\n` +
-      `• Private keys are shown ONLY when you generate a new wallet\n` +
-      `• Save your private key immediately when generated\n` +
-      `• Keys are encrypted with your user ID\n\n` +
-      `🔒 <b>Security Note:</b>\n` +
-      `If you didn't save your key when generated, you'll need to:\n` +
-      `• Import the wallet again with your saved key\n` +
-      `• Or generate a new wallet\n\n` +
-      `⚠️ Never share your private key with anyone!`,
-      { parse_mode: 'HTML', reply_markup: keyboard }
-    );
+    await ctx.editMessageText(message, { parse_mode: 'HTML', reply_markup: keyboard });
   } catch (error: any) {
-    await ctx.editMessageText(`❌ Error: ${error.message}`, { parse_mode: 'HTML' });
+    await ctx.editMessageText(`❌ Error retrieving key: ${error.message}`);
   }
+});
+
+// Delete message handler
+bot.callbackQuery('delete_this', async (ctx) => {
+    try {
+        await ctx.deleteMessage();
+    } catch {
+        await ctx.answerCallbackQuery('❌ Could not delete. Please delete manually.');
+    }
 });
 
 // Check token button
@@ -3630,7 +3689,7 @@ bot.command('portfolio', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -3683,7 +3742,7 @@ bot.command('price', async (ctx) => {
       await ctx.reply(`❌ Error: ${result.error || 'Failed to fetch price'}`);
     }
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -3720,7 +3779,7 @@ bot.command('pnl', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -3762,7 +3821,7 @@ bot.command('gas', async (ctx) => {
       await ctx.reply(`❌ Error: ${result.error || 'Failed to fetch gas prices'}`);
     }
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -3884,7 +3943,7 @@ bot.command('history', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -3927,7 +3986,7 @@ bot.command('alerts', async (ctx) => {
 
     await ctx.reply(message, { parse_mode: 'HTML' });
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 
@@ -4647,7 +4706,7 @@ bot.callbackQuery(/^execute_buy:(.+):(.+)$/, async (ctx) => {
       await ctx.reply(`❌ Buy Failed: ${result.error}`);
     }
   } catch (error: any) {
-    await ctx.reply(`❌ Error: ${error.message}`);
+    await handleBuyError(ctx, error);
   }
 });
 

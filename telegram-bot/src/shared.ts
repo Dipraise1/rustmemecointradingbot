@@ -148,20 +148,27 @@ export async function callRustAPI(endpoint: string, method: string = 'GET', body
       // Devnet account lookup failures - provide helpful context
       const pubkey = errorDetails.match(/pubkey=([a-zA-Z0-9]+)/)?.[1] || 'unknown';
       console.warn(`⚠️ [DEVNET] Account not found: ${pubkey.slice(0, 8)}...${pubkey.slice(-4)}`);
-      console.warn(`   This is expected on devnet for mainnet token addresses.`);
       console.warn(`   Endpoint: ${endpoint}`);
     } else if (isTokenRisk) {
       // Token risk warnings - don't spam logs
-      // Silent - these are expected security checks
     } else if (isNoPairsFound) {
       // Price lookup failures on devnet
       console.warn(`⚠️ [DEVNET] No trading pairs found for token`);
       console.warn(`   Endpoint: ${endpoint}`);
     } else {
-      // Unexpected errors - log with full details
-      console.error(`❌ API Error (${endpoint}):`, errorDetails);
-      if (parsedError) {
-        console.error(`   Details:`, JSON.stringify(parsedError, null, 2));
+      // Log based on status code
+      const statusMatch = errorDetails.match(/API error \((\d+)\)/);
+      const statusCode = statusMatch ? parseInt(statusMatch[1]) : 500;
+
+      if (statusCode >= 400 && statusCode < 499) {
+          // Client/User error - Keep it concise
+          console.warn(`⚠️ API Warning (${endpoint}): ${statusCode}. User Error: ${parsedError?.error || errorDetails}`);
+      } else {
+          // System error - log with full details
+          console.error(`❌ API Error (${endpoint}):`, errorDetails);
+          if (parsedError) {
+            console.error(`   Details:`, JSON.stringify(parsedError, null, 2));
+          }
       }
     }
     
