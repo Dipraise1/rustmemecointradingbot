@@ -1085,7 +1085,26 @@ async fn execute_sell(
     let position = match position {
         Ok(Some(p)) => p,
         Ok(None) => return (StatusCode::NOT_FOUND, Json(SellResponse { success: false, tx_hash: None, error: Some("Position not found".to_string()), profit_loss: None })),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(SellResponse { success: false, tx_hash: None, error: Some(e.to_string()), profit_loss: None })),
+        Err(e) => {
+            let error_message = e.to_string();
+            let status = if error_message.contains("Wallet error") 
+                || error_message.contains("Swap failed") 
+                || error_message.contains("Invalid")
+                || error_message.contains("not found") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (
+                status,
+                Json(SellResponse { 
+                    success: false, 
+                    tx_hash: None, 
+                    error: Some(error_message), 
+                    profit_loss: None 
+                }),
+            );
+        }
     };
     
     // Execute sell
