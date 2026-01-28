@@ -28,8 +28,13 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Scripts (exclude .sh files)
-*.sh
+# Scripts (exclude .sh files, except deployment ones)
+# *.sh
+!kill.sh
+!start_local.sh
+!start-bot.sh
+!start-engine.sh
+!start.sh
 
 # Markdown files (exclude all .md except README.md)
 *.md

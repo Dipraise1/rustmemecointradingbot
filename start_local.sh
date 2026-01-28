@@ -49,7 +49,7 @@ source ../.env
 set +a
 
 # Run in background, redirect logs to file to keep console clean
-cargo run --release > ../engine.log 2>&1 &
+cargo run --release --bin trading-engine > ../engine.log 2>&1 &
 ENGINE_PID=$!
 echo "   PID: $ENGINE_PID (Logs: engine.log)"
 cd ..
